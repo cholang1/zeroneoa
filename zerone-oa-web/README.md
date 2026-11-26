@@ -1,0 +1,70 @@
+# Zerone OA
+
+Zerone OA 是团队工作台，用于安排每周工作、记录日报和工时、跟进问题，以及查看团队进度。网页使用 React、TypeScript 和 Vite，后端使用 Node.js 和 MongoDB。
+
+## 主要功能
+
+| 入口 | 可以做什么 |
+| --- | --- |
+| 总览 | 查看日历、任务树、团队备忘，以及与工时、未完成计划和待解决问题有关的周提醒。 |
+| 工作内容 | 按周查看个人或团队的工作，填写周计划、日报和工时，参与评论。 |
+| 问题 | 集中查看日报中提出的问题和注意事项，跟进处理状态。 |
+| 统计 | 按成员或任务汇总工时。 |
+| 数据 | 查看数据规则、一级任务和近期操作记录。导入、导出在右上角菜单。 |
+| ZeroAI | 使用按账号保存的私人聊天。开启只读查询后，可查成员和任务目录、周计划、日报及工时，查看回答来源，或围绕结果继续追问。 |
+| 成员管理 | 账号管理员可从右上角菜单新增成员、开通或停用账号、重置密码。 |
+
+## 本地启动
+
+1. 安装 Node.js 22.12 或更高版本，启动 MongoDB。项目默认连接 `127.0.0.1:27018` 上的 `oa_business_dev` 库。如需更换地址或库名，见下方「数据库配置」。
+2. 在 `zeroa/zerone-oa-web/` 目录运行：
+
+   ```sh
+   npm ci
+   npm run dev
+   ```
+
+3. 打开 <http://127.0.0.1:5178>。`npm run dev` 同时启动网页和 API；网页会把 `/api` 请求转发到本机 `4318` 端口，不需要另启 API。
+
+### 首次登录与成员开通
+
+- **全新数据库**：启动 API 前，在后端环境或 `apps/api/.env` 中设置 `OA_SETUP_KEY`。使用至少 32 字节的随机数据，编码为 32～256 个不含空白的字符<node -p "require('node:crypto').randomBytes(32).toString('hex')"> 。在登录页选择「首次设置」，用该凭证创建管理员账号。设置成功后，移除凭证并重启 API。
+- **已有账号**：直接登录。管理员可在「菜单 → 成员管理」为已有成员开通账号，原有业务记录会保留。开通或重置时生成的初始口令只显示一次，成员首次使用时需修改密码。
+- **无法登录管理员账号**：运行 `node apps/api/src/cli/auth.mjs --help` 查看离线维护命令。执行维护前先停止访问目标库的 OA API，并用 `--db` 明确指定库名。
+
+## 配置与部署
+
+### 数据库配置
+
+后端优先使用 `MONGODB_URI`（进程环境优先于 `apps/api/.env`），其次读取 `apps/api/config/database.local.yaml`，最后读取 `apps/api/config/database.yaml`。启动日志会显示实际采用的配置来源。
+
+例如，本机 MongoDB 使用 `27017` 端口时，可新建 `apps/api/config/database.local.yaml`，指定独立的本地库：
+
+```yaml
+mongodb:
+  uri: 'mongodb://127.0.0.1:27017/oa_local_demo?retryWrites=false'
+```
+
+全新库首次启动时会自动创建集合和索引。同一个业务库只应由一个 OA API 实例写入。
+
+### ZeroAI 配置
+
+模型配置位于 `apps/api/config/ai.yaml`：在 `ai.profiles` 中填写模型的 API 根地址、模型名和密钥环境变量名，用 `ai.activeProfile` 选择模型。实际密钥放在后端环境或 `apps/api/.env`，不要写入 YAML。修改配置后重启 OA API。若不需要 AI，将 `ai.enabled` 设为 `false` 即可，日常填报不受影响。
+
+业务查询是只读的，不会修改 OA 记录。启用前应核对服务端 `ai.readTools` 授权范围和接收数据的模型。普通成员只能查询公共目录及本人的工作记录；只有获得团队查询授权的管理员才能查询他人或全队的记录。私人聊天不包含在团队数据导出中。
+
+### 生产部署
+
+使用 `npm run build` 构建网页，静态文件输出到 `apps/web/dist/`。后端设置 `NODE_ENV=production` 和 `OA_PUBLIC_ORIGIN`，后者填写网页的完整 HTTPS 源，例如 `https://oa.example.com`。通过反向代理在同一域名下提供网页和 `/api`，后端仅监听本机地址。数据库凭据、初始化凭证和模型密钥都保留在服务端，不提交到 Git。
+
+## 常用命令
+
+在 `zeroa/zerone-oa-web/` 目录运行：
+
+| 命令 | 用途 |
+| --- | --- |
+| `npm run dev` | 启动本地网页和 API。 |
+| `npm run build` | 构建网页。 |
+| `npm run typecheck` | 检查前端 TypeScript 类型。 |
+| `npm test` | 运行前后端测试；MongoDB 用例使用本机 `27018` 上的独立测试库。 |
+| `npm run test:e2e` | 构建网页并运行浏览器测试，需要本机 MongoDB，默认使用 Edge。 |
