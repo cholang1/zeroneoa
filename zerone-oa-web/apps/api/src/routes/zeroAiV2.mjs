@@ -9,6 +9,7 @@ import {
     queryCard,
     queryEvidence,
     queryPrompt,
+    reportIssuesTool,
     toolLabel
 } from '../services/agentQueryPolicy.mjs';
 
@@ -33,9 +34,16 @@ function failure(error) {
 export function createZeroAiV2Handler(store, completeAi, businessStore, readPolicy) {
     return async (request, response, url, {user, verify}) => {
         const owner = user.id;
+        const currentAccess = async () => queryAccess(readPolicy, await verify());
+        const principalFor = grants => ({
+            user: {id: owner},
+            isAccountAdmin: grants.team,
+            allowDetail: grants.detail,
+            allowIssues: grants.issues
+        });
         response.setHeader('Cache-Control', 'no-store');
         const send = async (status, data) => {
-            const access = queryAccess(readPolicy, await verify());
+            const access = await currentAccess();
             if (!response.destroyed) sendJson(response, status, data.session ? {
                 ...data,
                 session: publicSession(data.session, access)
@@ -45,7 +53,13 @@ export function createZeroAiV2Handler(store, completeAi, businessStore, readPoli
         if (!store) throw new StateError(503, '私人历史暂不可用。');
         if (request.method === 'GET' && url.pathname === `${prefix}/capabilities`) {
             store.check();
-            return send(200, {historyV2: true, ...(readPolicy && {readTools: true})});
+            const access = await currentAccess();
+            const readIssues = access?.issues === true && readToolDefinitions(principalFor(access))
+                .some(tool => tool.function.name === reportIssuesTool);
+            if (!response.destroyed) sendJson(response, 200, {
+                historyV2: true, ...(readPolicy && {readTools: true}), ...(readIssues && {readIssues: true})
+            });
+            return;
         }
         const refMatch = /^\/api\/zeroai\/v2\/sessions\/([\da-f-]{36})\/messages\/([\w-]{1,100})\/refs\/report\/([^/]{1,6144})$/.exec(url.pathname);
         if (request.method === 'GET' && refMatch) {
@@ -57,10 +71,17 @@ export function createZeroAiV2Handler(store, completeAi, businessStore, readPoli
                 throw invalid();
             }
             if (reportId.length > 512) throw invalid();
-            const access = queryAccess(readPolicy, await verify());
-            const ref = await store.reportRef(owner, sid, mid, reportId, access);
-            const target = await businessStore.verifyAgentReport(reportId, ref.teamVersion, ref.scopeStamp.team ? null : owner);
-            if (!canUse(ref.scopeStamp, queryAccess(readPolicy, await verify()))) throw new StateError(404, '引用不可用。');
+            const ref = await store.reportRef(owner, sid, mid, reportId, await currentAccess());
+            const verifyRef = async () => {
+                if (!canUse(ref.scopeStamp, await currentAccess())) throw new StateError(404, '引用不可用。');
+            };
+            await verifyRef();
+            let target;
+            try {
+                target = await businessStore.verifyAgentReport(reportId, ref.teamVersion, ref.scopeStamp.team ? null : owner);
+            } finally {
+                await verifyRef();
+            }
             if (!response.destroyed) sendJson(response, 200, target);
             return;
         }
@@ -100,10 +121,10 @@ export function createZeroAiV2Handler(store, completeAi, businessStore, readPoli
             (!regenerateMessageId && (!content || content.length > 4000))) throw invalid();
         const controller = new AbortController();
         const abort = () => controller.abort();
-        const access = queryAccess(readPolicy, await verify());
+        const access = await currentAccess();
         let scopeStamp;
         const verifyTurn = async () => {
-            const current = queryAccess(readPolicy, await verify());
+            const current = await currentAccess();
             if (response.destroyed) abort();
             if (!canUse(scopeStamp, current)) throw new StateError(403, '查询权限已变化，请重新提问。');
             return current;
@@ -188,11 +209,6 @@ export function createZeroAiV2Handler(store, completeAi, businessStore, readPoli
                     });
                     event({type: 'start'});
                 }
-                const principalFor = grants => ({
-                    user: {id: owner},
-                    isAccountAdmin: grants.team,
-                    allowDetail: grants.detail
-                });
                 const verifyTools = async () => {
                     controller.signal.throwIfAborted();
                     const current = await verifyTurn();
@@ -211,11 +227,13 @@ export function createZeroAiV2Handler(store, completeAi, businessStore, readPoli
                         args
                     });
                     if (!result.ok) return result;
-                    const business = ['list_weekly_plans', 'list_daily_reports', 'summarize_hours'].includes(name);
+                    const issues = name === reportIssuesTool;
+                    const business = issues || ['list_weekly_plans', 'list_daily_reports', 'summarize_hours'].includes(name);
                     scopeStamp = combineStamp(scopeStamp, {
                         target: current.target,
                         team: business && (args.scope === 'team' || Boolean(args.ownerId && args.ownerId !== owner)),
-                        detail: current.detail && ['list_weekly_plans', 'list_daily_reports'].includes(name)
+                        detail: current.detail && ['list_weekly_plans', 'list_daily_reports'].includes(name),
+                        issues
                     });
                     const card = queryCard(name, args, result);
                     await store.recordQuery(id, turnId, scopeStamp, card, queryEvidence(card, result.data), verifyTools);
@@ -254,7 +272,7 @@ export function createZeroAiV2Handler(store, completeAi, businessStore, readPoli
                 }
             }
             if (response.destroyed) return;
-            const finalAccess = queryAccess(readPolicy, await verify());
+            const finalAccess = await currentAccess();
             const error = !canUse(scopeStamp, finalAccess) ? {
                 status: 403,
                 error: '查询权限已变化。'

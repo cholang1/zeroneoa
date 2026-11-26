@@ -17,6 +17,12 @@ const marker = 'oa-business-v1';
 const memberColors = ['#1746a2', '#0f766e', '#b45309', '#7c3aed', '#be123c', '#2563eb', '#15803d'];
 const reportSort = {date: -1, _id: -1};
 const agentQueryTimeout = 4000;
+const dayMs = 86400000;
+// 使用 ECMAScript trim 的空白集合；Mongo 默认集合对 BOM、NUL 等的处理不同。
+const jsTrimChars = '\t\n\v\f\r ' + String.fromCodePoint(
+    0x00A0, 0x1680, 0x2000, 0x2001, 0x2002, 0x2003, 0x2004, 0x2005, 0x2006, 0x2007, 0x2008, 0x2009, 0x200A,
+    0x2028, 0x2029, 0x202F, 0x205F, 0x3000, 0xFEFF
+);
 const literalRegex = value => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 function boundedField(field, max) {
@@ -31,6 +37,39 @@ function ownerFilter(ownerId) {
 
 function reportFilter({from, to, taskId}, ownerId) {
     return {...ownerFilter(ownerId), date: {$gte: from, $lte: to}, ...(taskId !== undefined && {taskId})};
+}
+
+function issueFilter({from, to, taskId, status, dateBy, resolvedByMe}, ownerId, memberId) {
+    const {$expr: sameOwner, ...filter} = ownerFilter(ownerId);
+    const resolved = {$eq: ['$resolved', true]};
+    const checks = [{
+        $cond: [
+            {$eq: [{$type: '$notes'}, 'string']}, {$ne: [{$trim: {input: '$notes', chars: jsTrimChars}}, '']}, false
+        ]
+    }];
+    if (sameOwner) checks.push(sameOwner);
+    if (taskId !== undefined) filter.taskId = taskId;
+    if (status === 'open') checks.push({$not: [resolved]});
+    if (status === 'resolved' || (from !== undefined && dateBy === 'resolved')) checks.push(resolved);
+    if (resolvedByMe !== undefined) {
+        const byMe = {$and: [resolved, {$eq: ['$resolvedById', {$literal: memberId}]}]};
+        checks.push(resolvedByMe ? byMe : {$not: [byMe]});
+    }
+    if (from !== undefined) {
+        if (dateBy === 'reported') filter.date = {$gte: from, $lte: to};
+        else {
+            // 先转时间点，再用北京日期的半开区间比较；兼容旧 ISO Z 和当前 +08:00 存储。
+            const start = new Date(`${from}T00:00:00+08:00`);
+            const end = new Date(Date.parse(`${to}T00:00:00+08:00`) + dayMs);
+            checks.push({
+                $let: {
+                    vars: {at: {$dateFromString: {dateString: '$resolvedAt', onError: null, onNull: null}}},
+                    in: {$and: [{$gte: ['$$at', start]}, {$lt: ['$$at', end]}]}
+                }
+            });
+        }
+    }
+    return {...filter, $expr: {$and: checks}};
 }
 
 async function validateWrite(validate) {
@@ -183,7 +222,7 @@ export async function openStore(uri, {
             return new Map(users.map(user => [user._id, user.name]));
         }
 
-        function agentReadPage(name, {filters, ownerId, includeOwner, allowDetail, before, limit}) {
+        function agentReadPage(name, {filters, ownerId, includeOwner, allowDetail, before, limit, memberId}) {
             return run(async teamVersion => {
                 if (before && before.teamVersion !== teamVersion) throw new StateError(409, '分页期间团队数据已更新。');
                 const {query, weekId, taskId, completed, status} = filters;
@@ -222,6 +261,15 @@ export async function openStore(uri, {
                         filter = reportFilter(filters, ownerId);
                         sort = reportSort;
                         projection = {date: 1, weekId: 1, taskId: 1, hours: 1, ...owner, ...detail};
+                        break;
+                    case 'list_report_issues':
+                        key = 'dailyReports';
+                        filter = issueFilter(filters, ownerId, memberId);
+                        sort = reportSort;
+                        projection = {
+                            date: 1, taskId: 1, resolved: 1, resolvedAt: 1, resolvedById: 1,
+                            notes: boundedField('notes', 1000), solution: boundedField('solution', 1000), ...owner
+                        };
                         break;
                     default:
                         throw new StateError(400, '不支持此查询工具。');

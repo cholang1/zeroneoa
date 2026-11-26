@@ -8,6 +8,8 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {aiTargetKey, initializeAi, requestAiChat} from '../src/services/ai.mjs';
 
+import {readToolDefinitions} from '../src/services/agentReadTools.mjs';
+
 const messages = [{role: 'user', content: '查一下我的日报'}];
 const tools = [{
     type: 'function', function: {
@@ -136,6 +138,28 @@ test('JSON 原生工具：空正文、多调用按序回传、逐次复核，不
         }
     ]);
     assert.equal(messages.length, 1);
+});
+
+test('问题工具的实际定义能通过模型协议校验，撤销该授权后不会向模型注册', async t => {
+    const principal = {user: {id: 'member-a'}, allowIssues: true};
+    const name = 'list_report_issues';
+    const args = {dateBy: 'resolved', resolvedByMe: true, from: '2026-11-16', to: '2026-11-22'};
+    const {requests} = await fixture(t, (res, n) => json(res, n === 1
+        ? callsReply(call('issue-call', JSON.stringify(args), name)) : textReply('核对完成。')));
+    const calls = [];
+    const run = allowIssues => requestAiChat([{role: 'user', content: '我上周解决了什么？'}], options({
+        tools: readToolDefinitions({...principal, allowIssues}),
+        executeTool: async (name, args) => {
+            calls.push([name, args]);
+            return {ok: true, data: {items: []}};
+        }
+    }));
+    await run(true);
+    await run(false);
+    assert.deepEqual(calls, [[name, args]]);
+    assert.ok(requests[0].tools.some(tool => tool.function.name === name));
+    assert.equal(requests[1].messages.at(-1).tool_call_id, 'issue-call');
+    assert.ok(!requests[2].tools.some(tool => tool.function.name === name));
 });
 
 test('SSE 按索引拼接交错的 ID、函数名、参数和中文，工具轮草稿不外露', async t => {

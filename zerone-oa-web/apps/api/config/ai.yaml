@@ -23,3 +23,4 @@ ai:
     approvedTarget: ""   # 已核准的端点和模型指纹
     allowTeamRead: false # 允许管理员查询其他成员或全队
     allowDetail: false   # 允许发送日报和周计划正文
+    allowIssues: false   # 允许发送日报中记录的问题和解决方案

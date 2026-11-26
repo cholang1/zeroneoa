@@ -233,11 +233,14 @@ export function ZeroAiPage(props: ZeroAiPageProps) {
         );
     }
 
-    return <ZeroAiChat {...props} readTools={capabilities.readTools === true}/>;
+    return <ZeroAiChat {...props} readTools={capabilities.readTools === true}
+                       readIssues={capabilities.readTools === true && capabilities.readIssues === true}/>;
 }
 
-function ZeroAiChat({user, visible, api: history, readTools, onOpenReportSource}: ZeroAiPageProps & {
-    readTools: boolean
+const openIssuesPrompt = "我目前有哪些未解决的日报问题？请列出关联任务和已有的解决方案。";
+
+function ZeroAiChat({user, visible, api: history, readTools, readIssues, onOpenReportSource}: ZeroAiPageProps & {
+    readTools: boolean; readIssues: boolean
 }) {
     const [sessionList, setSessionList] = useState<ZeroAiSessionsResponse>({sessions: []});
     const [listError, setListError] = useState("");
@@ -949,6 +952,10 @@ function ZeroAiChat({user, visible, api: history, readTools, onOpenReportSource}
                                 <>
                                     <strong>开始一段对话</strong>
                                     <span>{readTools ? "ZeroAI 有什么可以帮你的？" : "仅聊天，当前未开放OA数据查询。"}</span>
+                                    {readIssues &&
+                                        <button type="button" className="text-button" title={openIssuesPrompt}
+                                                disabled={!canRevise || draftWithFollowUp(openIssuesPrompt).length > maxPromptLength}
+                                                onClick={() => fillFollowUp(openIssuesPrompt)}>查我的未解决问题</button>}
                                 </>
                             ) : null}
                         </div>

@@ -35,13 +35,33 @@ const tools = new Map(Object.entries({
         description: '统计北京日期闭区间内全部匹配日报的工时（最多 31 天），不受分页影响，默认仅本人。',
         properties: {...ranged, groupBy: choice('day', 'task', 'total')}, required: ['from', 'to', 'groupBy'],
         refType: 'hours', business: true
+    },
+    list_report_issues: {
+        description: '查询日报中记录的问题，默认仅本人、未解决，不限日期（含历史积压）。日期需同时给出起止，最多 31 天。',
+        properties: {
+            ...ranged,
+            status: {...choice('open', 'resolved', 'all'), default: 'open'},
+            dateBy: {
+                ...choice('reported', 'resolved'), default: 'reported',
+                description: '有起止日期时按日报日期或北京时间的解决日期筛选。查解决日期不指定 status 时默认 resolved；返回的 date 仍是日报日期。'
+            },
+            resolvedByMe: {
+                type: 'boolean',
+                description: 'true 仅查当前由我解决的问题，未指定 status 时用 resolved；false 排除这些问题。不改变日报归属范围。'
+            },
+            ...page
+        },
+        required: [], refType: 'report', business: true, issues: true
     }
 }));
 
 function subject(principal) {
     const memberId = principal?.user?.id;
     if (typeof memberId !== 'string' || !memberId.trim() || principal.mustChangePassword === true) return null;
-    return {memberId, admin: principal.isAccountAdmin === true, allowDetail: principal.allowDetail === true};
+    return {
+        memberId, admin: principal.isAccountAdmin === true, allowDetail: principal.allowDetail === true,
+        allowIssues: principal.allowIssues === true
+    };
 }
 
 function schema(tool, admin) {
@@ -54,7 +74,7 @@ function schema(tool, admin) {
 export function readToolDefinitions(principal) {
     const caller = subject(principal);
     if (!caller) return [];
-    return [...tools].map(([name, tool]) => ({
+    return [...tools].filter(([, tool]) => !tool.issues || caller.allowIssues).map(([name, tool]) => ({
         type: 'function',
         function: {
             name,
@@ -110,8 +130,15 @@ function parseArguments(tool, caller, args) {
         values[key] = value;
     }
     if (values.scope !== undefined && values.ownerId !== undefined) return invalid();
+    if ((values.from === undefined) !== (values.to === undefined)) return invalid();
     if (values.from && (values.from > values.to || Date.parse(values.to) - Date.parse(values.from) >= 31 * dayMs)) {
         return fail('INVALID_ARGUMENT', '日期必须是最多 31 天的闭区间，开始日期不能晚于结束日期。');
+    }
+    if (tool.issues && (values.resolvedByMe === true || (values.dateBy === 'resolved' && values.from !== undefined))) {
+        if (!Object.hasOwn(args, 'status')) values.status = 'resolved';
+        else if (values.status === 'open') {
+            return fail('INVALID_ARGUMENT', '按解决日期或查询我解决的问题时，status 请使用 resolved 或 all。');
+        }
     }
     return {ok: true, values};
 }
@@ -148,7 +175,7 @@ function bounded(value, max) {
     return {value: chars.length > max ? chars.slice(0, max).join('') : value, clipped: chars.length > max};
 }
 
-function projectRow(row, type, includeOwner, allowDetail) {
+function projectRow(row, {refType: type, issues}, includeOwner, allowDetail) {
     if (typeof row.id !== 'string' || !row.id) return null;
     const item = {id: row.id};
     let clipped = false;
@@ -177,24 +204,37 @@ function projectRow(row, type, includeOwner, allowDetail) {
         copy('ownerId', 'string');
         label = item.title || '任务';
     } else {
-        copy('weekId', 'string');
         copy('taskId', 'string');
-        if (type === 'plan') {
-            copy('completed', 'boolean');
-            if (!item.weekId || !validWeek(item.weekId)) return null;
-            label = `${item.weekId} 周计划`;
-        } else {
-            if (typeof row.date !== 'string' || !validDate(row.date) || !Number.isFinite(row.hours) ||
-                !item.weekId || !validWeek(item.weekId)) return null;
+        if (issues) {
+            if (typeof row.date !== 'string' || !validDate(row.date) || typeof row.notes !== 'string') return null;
             item.date = row.date;
-            item.hours = row.hours;
-            label = `${item.date} 日报`;
+            copyText('notes', 1000);
+            item.resolved = row.resolved === true;
+            copyText('solution', 1000);
+            if (item.resolved) {
+                copy('resolvedById', 'string');
+                copy('resolvedAt', 'string');
+            }
+            const taskLabel = bounded(item.taskId, 128).value;
+            label = `${item.date}${taskLabel ? ` ${taskLabel}` : ''} 日报问题`;
+        } else {
+            copy('weekId', 'string');
+            if (!item.weekId || !validWeek(item.weekId)) return null;
+            if (type === 'plan') {
+                copy('completed', 'boolean');
+                label = `${item.weekId} 周计划`;
+            } else {
+                if (typeof row.date !== 'string' || !validDate(row.date) || !Number.isFinite(row.hours)) return null;
+                item.date = row.date;
+                item.hours = row.hours;
+                label = `${item.date} 日报`;
+            }
+            if (allowDetail) copyText('detail', 1000);
         }
         if (includeOwner) {
             copy('ownerId', 'string');
             copyText('ownerName', 256);
         }
-        if (allowDetail) copyText('detail', 1000);
     }
     return {item, ref: {type, id: row.id, label}, clipped};
 }
@@ -206,6 +246,7 @@ export async function executeReadTool({store, principal, name, args} = {}) {
     if (!caller) return forbidden();
     const tool = tools.get(name);
     if (!tool) return fail('INVALID_ARGUMENT', '不支持此查询工具。');
+    if (tool.issues && !caller.allowIssues) return forbidden();
     const parsed = parseArguments(tool, caller, args);
     if (!parsed.ok) return parsed;
     const {cursor, limit, scope, ...filters} = parsed.values;
@@ -260,9 +301,10 @@ export async function executeReadTool({store, principal, name, args} = {}) {
         const before = cursor === undefined ? null : readCursor(cursor, key, binding);
         if (cursor !== undefined && !before) return fail('INVALID_ARGUMENT', '分页游标无效，请从第一页重查。');
         const {rows, asOf, teamVersion} = await store.agentReadPage(name, {
-            filters, ownerId, includeOwner, allowDetail: caller.allowDetail, before, limit
+            filters, ownerId, includeOwner, allowDetail: caller.allowDetail, before, limit,
+            ...(tool.issues && {memberId: caller.memberId})
         });
-        const projected = rows.slice(0, limit).map(row => projectRow(row, tool.refType, includeOwner, caller.allowDetail));
+        const projected = rows.slice(0, limit).map(row => projectRow(row, tool, includeOwner, caller.allowDetail));
         if (projected.includes(null)) return unavailable();
         for (let count = projected.length; count >= Math.min(1, projected.length); count--) {
             const page = projected.slice(0, count);

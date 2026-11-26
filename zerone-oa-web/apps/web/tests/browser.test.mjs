@@ -1209,6 +1209,56 @@ test('P2 本地端到端：真实本人日报查询、来源核对、返回聊�
     assert.deepEqual(await store.read(), before, '查询、引用核对和追问不修改团队数据');
 });
 
+test('ZeroAI 查日报问题：快捷入口只填草稿，授权问题不外发普通正文，来源定位到原日报', {timeout: 45000}, async t => {
+    let calls = 0;
+    const {store, url, newPage} = await browserFixture(t, {
+        readPolicy: {target: 'issues-browser-local', issues: true, detail: false, team: false},
+        completeAi: async (_messages, {executeTool}) => {
+            calls++;
+            const result = await executeTool('list_report_issues', {status: 'open'});
+            assert.equal(result.ok, true);
+            assert.deepEqual(result.data.items.map(item => item.id), ['issue-own']);
+            assert.doesNotMatch(JSON.stringify(result.data), /禁止外发的正文|同事的问题|私有评论/);
+            return {content: `${result.data.items[0].notes}；${result.data.items[0].solution}`};
+        }
+    });
+    const [, account, other] = await seedAccounts(store);
+    const report = (id, ownerId, notes) => ({
+        key: 'dailyReports', id, before: null, after: {
+            id,
+            ownerId,
+            date: '2024-05-06',
+            weekId: '2024-W19',
+            taskId: 'T01',
+            detail: '禁止外发的正文',
+            hours: 1,
+            notes,
+            solution: '补充样例后复核',
+            comments: [{id: 'c', authorId: ownerId, text: '私有评论', createdAt: '2024-05-06T09:00:00+08:00'}],
+            createdById: ownerId,
+            updatedById: ownerId,
+            createdAt: '2024-05-06T09:00:00+08:00',
+            updatedAt: '2024-05-06T09:00:00+08:00'
+        }
+    });
+    await store.patch((await store.read()).version, [report('issue-own', account.user.id, '样例尚未确认'),
+        report('issue-other', other.user.id, '同事的问题')]);
+    const before = await store.read();
+    const page = await newPage();
+    await enter(page, url, account);
+    await tab(page, 'ZeroAI');
+    await page.getByRole('button', {name: '查我的未解决问题'}).click();
+    assert.match(await page.getByRole('textbox', {name: '消息内容'}).inputValue(), /未解决的日报问题/);
+    assert.equal(calls, 0);
+    await page.getByRole('button', {name: '发送', exact: true}).click();
+    await page.getByText('样例尚未确认；补充样例后复核', {exact: true}).waitFor();
+    await page.getByRole('button', {name: /^打开日报：/}).click();
+    const row = page.getByRole('group', {name: '引用的日报'});
+    await row.waitFor();
+    assert.equal(await row.getAttribute('data-report-id'), 'issue-own');
+    assert.deepEqual(await store.read(), before);
+});
+
 test('管理员查看他人工作内容：日报来源定位、窄屏只读展示及周次、成员与统计筛选', {timeout: 45000}, async t => {
     const date = '2027-01-01', weekId = '2026-W53', taskId = 'T02.2.1', missing = 'T02.2.9';
     const title = '鉴权功能模块接口开发' + 'AuthModule'.repeat(14);

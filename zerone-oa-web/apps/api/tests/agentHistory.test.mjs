@@ -303,7 +303,7 @@ test('服务首次启动为已初始化的业务库迁移 v2 私人历史，不�
     const fresh = await (await fixture.boot()).browser();
     assert.deepEqual(await fresh(capabilities), {status: 200, historyV2: true});
     const markerAfter = await meta.findOne({_id: 'default'});
-    assert.equal(markerAfter.agentSchemaVersion, 2);
+    assert.equal(markerAfter.agentSchemaVersion, 3);
     assert.equal(markerAfter.schema, markerBefore.schema);
     assert.equal(markerAfter.version, business.version);
     const collectionsAfter = await collectionNames(fixture.db);
@@ -312,11 +312,14 @@ test('服务首次启动为已初始化的业务库迁移 v2 私人历史，不�
     assert.deepEqual(await listSessions(fresh), []);
 
     const newSession = await createSession(fresh);
-    // 原 P1 三个集合不需重建，升级后旧二进制必须拒读带权限的回答。
-    await meta.updateOne({_id: 'default'}, {$set: {agentSchemaVersion: 1}});
-    const reopened = await (await fixture.boot()).browser();
-    assert.deepEqual(await getSession(reopened, `${sessions}/${newSession.id}`), newSession);
-    assert.deepEqual(expectStatus(await reopened('/api/state'), 200).state, business);
+    // 此测试库还没有查询记录，可用旧标记模拟升级。原 P1/P2 三个集合都不需重建。
+    for (const oldVersion of [1, 2]) {
+        await meta.updateOne({_id: 'default'}, {$set: {agentSchemaVersion: oldVersion}});
+        const reopened = await (await fixture.boot()).browser();
+        assert.equal((await meta.findOne({_id: 'default'})).agentSchemaVersion, 3);
+        assert.deepEqual(await getSession(reopened, `${sessions}/${newSession.id}`), newSession);
+        assert.deepEqual(expectStatus(await reopened('/api/state'), 200).state, business);
+    }
 });
 
 test('已登录客户端请求旧聊天协议返回 404，不设置聊天 Cookie 或调用模型', options, async t => {

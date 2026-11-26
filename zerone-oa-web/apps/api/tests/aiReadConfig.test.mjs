@@ -36,7 +36,8 @@ async function fixture(t) {
         approvedProfile: 'mock',
         approvedTarget: target,
         allowTeamRead: true,
-        allowDetail: true
+        allowDetail: true,
+        allowIssues: true
     };
     return {ai, env, local, boot, target, full};
 }
@@ -44,9 +45,18 @@ async function fixture(t) {
 test('共享 YAML 可授权，本机整组替换，关闭、换模型或换端点不沿用旧授权', async t => {
     const {ai, local, boot, target, full} = await fixture(t);
     ai.readTools = full;
-    assert.deepEqual(await boot(), {source: 'ai.yaml', policy: {target, team: true, detail: true}});
-    await writeFile(local, `ai:\n  readTools:\n    enabled: true\n    approvedProfile: mock\n    approvedTarget: "${target}"\n`);
-    assert.deepEqual(await boot(), {source: 'ai.local.yaml', policy: {target, team: false, detail: false}});
+    assert.deepEqual(await boot(), {source: 'ai.yaml', policy: {target, team: true, detail: true, issues: true}});
+    const localConfig = `ai:\n  readTools:\n    enabled: true\n    approvedProfile: mock\n    approvedTarget: "${target}"\n`;
+    await writeFile(local, localConfig);
+    assert.deepEqual(await boot(), {
+        source: 'ai.local.yaml',
+        policy: {target, team: false, detail: false, issues: false}
+    });
+    await writeFile(local, `${localConfig}    allowIssues: true\n`);
+    assert.deepEqual(await boot(), {
+        source: 'ai.local.yaml',
+        policy: {target, team: false, detail: false, issues: true}
+    });
     await writeFile(local, 'ai:\n  readTools:\n    enabled: false\n');
     assert.equal((await boot()).policy, null);
     await rm(local);
@@ -59,11 +69,13 @@ test('共享 YAML 可授权，本机整组替换，关闭、换模型或换端�
 
 test('本机或共享权限配错都不授予权限，本机出错不继承共享授权，普通聊天仍可用', async t => {
     const {ai, local, boot, full} = await fixture(t);
-    ai.readTools = {...full, allowDetail: 'false'};
-    assert.equal((await boot()).policy, null);
+    for (const setting of ['allowDetail', 'allowIssues']) {
+        ai.readTools = {...full, [setting]: 'false'};
+        assert.equal((await boot()).policy, null);
+    }
     ai.readTools = full;
     for (const source of ['[', '', 'ai: {readTool: {enabled: true}}', 'ai: {readTools: null}',
-        ...[{...full, allowTeamRead: 'false'}, {...full, allowTeam: true}, {
+        ...[{...full, allowTeamRead: 'false'}, {...full, allowTeam: true}, {...full, allowIssues: 'true'}, {
             ...full,
             approvedTarget: ''
         }, {enabled: true}]

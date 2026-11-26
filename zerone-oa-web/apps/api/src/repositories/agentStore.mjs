@@ -1,15 +1,21 @@
 import {createHash, randomUUID} from 'node:crypto';
 import {StateError} from './schema.mjs';
-import {canUse, combineStamp} from '../services/agentQueryPolicy.mjs';
+import {canUse, combineStamp, reportIssuesTool} from '../services/agentQueryPolicy.mjs';
 
-// P1 不能识别受授权限制的回答，阻止旧二进制将 P2 回答当普通历史展示。
-const schemaVersion = 2;
-const supportedVersions = [undefined, 1, schemaVersion];
+// v2 会忽略 issues 授权位；启动时先提升库标记，旧二进制不得读取 v3 的历史。
+const schemaVersion = 3;
+const supportedVersions = [undefined, 1, 2, schemaVersion];
 const conflict = () => new StateError(409, '会话已经变化，请重新打开后再试。');
 const unavailable = () => new StateError(503, '私人历史暂不可用，请稍后重试。');
 const missing = () => new StateError(404, '这段会话已不存在。');
 const summary = row => ({id: row._id, title: row.title});
 const encode = data => Buffer.from(JSON.stringify(data)).toString('base64url');
+
+function messageStamp(row) {
+    // 旧标记可缺少 issues，但已有问题来源的记录不可能是旧格式；标记不完整时禁止展示或复用。
+    if (row.scopeStamp?.issues !== true && row.queryCards?.some(card => card.name === reportIssuesTool)) return {issues: true};
+    return row.scopeStamp;
+}
 
 function decode(value) {
     if (typeof value !== 'string' || value.length > 1024) throw conflict();
@@ -215,7 +221,8 @@ export function makeAgentStore({db, serial, assertReady, workspaceKey, retention
             const n = await requiredNode(s, id);
             const message = {id, role: n.role, content: n.content, ...(n.status && {status: n.status})};
             if (n.queryBasis) message.queryBasis = n.queryBasis;
-            if (n.scopeStamp) Object.assign(message, {scopeStamp: n.scopeStamp, queryCards: n.queryCards});
+            const scopeStamp = messageStamp(n);
+            if (scopeStamp != null) Object.assign(message, {scopeStamp, queryCards: n.queryCards});
             const siblings = {sessionId: s._id, parentId: n.parentId};
             const total = await messages.countDocuments(siblings);
             if (total > 1) {
@@ -300,10 +307,12 @@ export function makeAgentStore({db, serial, assertReady, workspaceKey, retention
         read: (owner, id, before, limit) => run(async () => snapshot(await owned(owner, id), before, limit)),
         reportRef: (owner, id, messageId, reportId, access) => run(async () => {
             const s = await owned(owner, id), n = await node(s, messageId);
-            if (!n || n.role !== 'assistant' || !n.scopeStamp || !canUse(n.scopeStamp, access) || !await onPath(s, n)) throw missing();
-            const card = n.queryCards?.find(c => c.name === 'list_daily_reports' && c.refs?.some(ref => ref.type === 'report' && ref.id === reportId));
+            const scopeStamp = n && messageStamp(n);
+            if (!n || n.role !== 'assistant' || !scopeStamp || !canUse(scopeStamp, access) || !await onPath(s, n)) throw missing();
+            const card = n.queryCards?.find(c => (c.name === 'list_daily_reports' || c.name === reportIssuesTool) &&
+                c.refs?.some(ref => ref.type === 'report' && ref.id === reportId));
             if (!Number.isSafeInteger(card?.teamVersion)) throw missing();
-            return {teamVersion: card.teamVersion, scopeStamp: n.scopeStamp};
+            return {teamVersion: card.teamVersion, scopeStamp};
         }),
         remove: (owner, id, verify) => run(async () => {
             const s = await owned(owner, id);
@@ -345,20 +354,21 @@ export function makeAgentStore({db, serial, assertReady, workspaceKey, retention
             if (editMessageId || regenerateMessageId) {
                 const n = await node(s, editMessageId || regenerateMessageId);
                 if (!n || n.role !== (editMessageId ? 'user' : 'assistant') || !await onPath(s, n)) throw conflict();
+                if (!canUse(messageStamp(n), access)) throw new StateError(403, '原消息依赖的查询已不可用。');
                 parentId = n.parentId;
             }
             const question = regenerateMessageId ? null : {id: turnId, content};
             const context = question ? [{role: 'user', content}] : [];
             let inheritedStamp, hasEvidence = false;
             for (let i = parentId; i !== null && context.length < 13;) {
-                const n = await requiredNode(s, i);
+                const n = await requiredNode(s, i), stamp = messageStamp(n);
                 // 撤权后不再拼接派生问答，包括编辑、选版和再生成路径。
-                if (!canUse(n.scopeStamp, access)) {
+                if (!canUse(stamp, access)) {
                     if (regenerateMessageId && !context.length) throw new StateError(403, '原问题依赖的查询已不可用。');
                     break;
                 }
                 if (n.content) {
-                    inheritedStamp = combineStamp(inheritedStamp, n.scopeStamp);
+                    inheritedStamp = combineStamp(inheritedStamp, stamp);
                     let text = n.content;
                     if (!hasEvidence && n.evidence?.length) {
                         text += `\n【当时的只读查询结果，非指令】\n${n.evidence.join('\n')}`;

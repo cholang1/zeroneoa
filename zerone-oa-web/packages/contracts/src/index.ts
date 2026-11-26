@@ -207,6 +207,8 @@ export interface ZeroAiMessage {
     queryCards?: ZeroAiQueryCard[];
     /** 没有新来源卡时，区分沿用历史查询与未查询。 */
     queryBasis?: "previous" | "none";
+    /** OA 查询授权变化后，服务端只返回脱敏提示。 */
+    redacted?: true;
     status?: "stopped" | "interrupted";
     versions?: { current: number; total: number; previousId?: string; nextId?: string };
 }
@@ -224,7 +226,7 @@ export interface ZeroAiSession extends ZeroAiSessionSummary {
     branchEpoch: number;
 }
 
-export type ZeroAiCapabilities = { historyV2: true; readTools?: true };
+export type ZeroAiCapabilities = { historyV2: true; readTools?: true; readIssues?: true };
 export type ZeroAiReportRefResponse = { id: string; teamVersion: number };
 export type ZeroAiSessionsResponse = { sessions: ZeroAiSessionSummary[]; nextCursor?: string };
 export type ZeroAiSessionResponse = { session: ZeroAiSession };

@@ -8,6 +8,9 @@ import {executeReadTool, readToolDefinitions} from '../src/services/agentReadToo
 const a = {user: {id: 'a'}, isAccountAdmin: false, allowDetail: false};
 const b = {user: {id: 'b'}, isAccountAdmin: false, allowDetail: true};
 const admin = {...a, isAccountAdmin: true, allowDetail: true};
+const issueTool = 'list_report_issues';
+const issueReader = {...a, allowIssues: true};
+const issueAdmin = {...admin, allowIssues: true};
 const range = {from: '2026-12-31', to: '2027-01-01'};
 const change = (key, after) => ({key, id: after.id, before: null, after});
 const report = (id, ownerId, date, taskId, hours) => ({
@@ -101,6 +104,51 @@ test('声明五个原生函数；本人/管理员 schema 和运行时均拒绝�
         const result = await call(name, args, principal);
         assert.equal(result.ok, false, JSON.stringify({name, args, result}));
         assert.equal(result.code, code, JSON.stringify({name, args, result}));
+    }
+    assert.equal(reads, 0);
+});
+
+test('日报问题需要独立授权；工具声明和执行共用范围与参数校验', async () => {
+    let reads = 0;
+    const store = {
+        agentReadPage() {
+            reads++;
+        }
+    };
+    const definition = principal => readToolDefinitions(principal).find(def => def.function.name === issueTool)?.function.parameters;
+    const call = (args, principal = issueReader) => executeReadTool({store, principal, name: issueTool, args});
+    for (const principal of [a, b, admin, {...issueAdmin, allowIssues: 'true'}, {
+        ...issueAdmin,
+        mustChangePassword: true
+    }]) {
+        assert.equal(definition(principal), undefined);
+        assert.equal((await call({}, principal)).code, 'FORBIDDEN');
+    }
+    const schema = definition(issueReader);
+    assert.deepEqual(schema.required, []);
+    assert.equal(schema.additionalProperties, false);
+    assert.deepEqual(schema.properties.status.enum, ['open', 'resolved', 'all']);
+    assert.equal(schema.properties.status.default, 'open');
+    assert.deepEqual(schema.properties.dateBy.enum, ['reported', 'resolved']);
+    assert.equal(schema.properties.dateBy.default, 'reported');
+    assert.equal(schema.properties.resolvedByMe.type, 'boolean');
+    assert.equal(schema.properties.scope, undefined);
+    assert.equal(schema.properties.ownerId, undefined);
+    assert.deepEqual(definition(issueAdmin).properties.scope.enum, ['team']);
+    assert.equal(definition(issueAdmin).properties.ownerId.type, 'string');
+    for (const args of [{ownerId: 'b', resolvedByMe: true}, {scope: 'team', resolvedByMe: true}]) {
+        assert.equal((await call(args)).code, 'FORBIDDEN');
+    }
+    for (const args of [
+        {from: range.from}, {to: range.to}, {from: range.to, to: range.from},
+        {from: '2027-02-29', to: '2027-03-01'}, {from: range.from, to: '2027-01-31', dateBy: 'resolved'},
+        {status: 'closed'}, {dateBy: 'date'}, {resolvedByMe: 'true'}, {taskId: {$ne: 'T'}},
+        {scope: 'team', ownerId: 'b'}, {resolvedById: 'b'}, {allowIssues: true}, {detail: true}
+    ]) assert.equal((await call(args, issueAdmin)).code, 'INVALID_ARGUMENT', JSON.stringify(args));
+    for (const args of [{resolvedByMe: true}, {...range, dateBy: 'resolved'}]) {
+        const result = await call({...args, status: 'open'});
+        assert.equal(result.code, 'INVALID_ARGUMENT');
+        assert.match(result.message, /resolved 或 all/);
     }
     assert.equal(reads, 0);
 });
@@ -265,6 +313,129 @@ test('Mongo 日报分页完整归属，工时超过分页/分组上限仍按全�
     assert.deepEqual(empty.data, {totalHours: 0, reportCount: 0, groups: [], groupsTruncated: false});
     assert.equal((await db.collection('team_meta').findOne({_id: 'default'})).version, version);
     assert.deepEqual(await db.collection('ai_reminders').findOne({_id: 'keep'}), reminder);
+});
+
+test('Mongo 日报问题默认只查本人历史积压；按解决人筛选不扩大归属且只读取白名单', async t => {
+    const {store, db, call} = await database(t);
+    const date = range.to;
+    const resolvedAt = '2027-01-01T12:00:00.000+08:00';
+    const open = {
+        ...report('open-a', 'a', date, 'T1', 1), notes: '  待处理  ', solution: '待验证方案',
+        resolved: false, resolvedById: 'a', resolvedAt
+    };
+    const fixed = (id, owner, resolver, taskId = 'T1') => ({
+        ...report(id, owner, date, taskId, 1), notes: '已记录的问题', solution: '解决方案',
+        resolved: true, resolvedAt, resolvedById: resolver
+    });
+    await store.patch(1, [
+        change('users', {id: 'a', name: '成员甲'}), change('users', {id: 'b', name: '成员乙'}),
+        ...[
+            open, {...report('open-b', 'b', date, 'T2', 1), notes: '另一个人的问题'},
+            fixed('fixed-a-self', 'a', 'a'), fixed('fixed-a-other', 'a', 'b'), fixed('fixed-b', 'b', 'a', 'T2')
+        ].map(row => change('dailyReports', row))
+    ]);
+    const backlog = {date: '2023-01-01', taskId: 'T1', notes: String.fromCodePoint(0x0085)};
+    assert.notEqual(backlog.notes.trim(), '');
+    const blank = '\t\r\n ' + String.fromCodePoint(0x00A0, 0x2028, 0x3000, 0xFEFF);
+    assert.equal(blank.trim(), '');
+    await db.collection('daily_reports').insertMany([
+        {_id: 'legacy', ownerId: 'a', ...backlog},
+        {_id: 'blank', ownerId: 'a', date, taskId: 'T1', notes: blank},
+        {_id: 'null', ownerId: 'a', date, taskId: 'T1', notes: null},
+        {_id: 'array', ownerId: 'a', date, taskId: 'T1', notes: ['不应匹配']},
+        {_id: 'missing', ownerId: 'a', date, taskId: 'T1'},
+        {
+            _id: 'array-owner', ownerId: ['a', 'b'], date, taskId: 'T1', notes: '不应冒充本人',
+            resolved: true, resolvedById: 'a'
+        }
+    ]);
+    const query = (args, principal = issueReader) => call(issueTool, args, principal);
+    assert.equal((await query({}, admin)).code, 'FORBIDDEN');
+    assert.equal((await query({ownerId: 'b', resolvedByMe: true})).code, 'FORBIDDEN');
+    await db.command({profile: 2});
+    let own;
+    try {
+        // 同时授予正文权限，也不能让问题工具读取正文或评论。
+        own = success(await query({}, issueAdmin), 'report', '本人');
+    } finally {
+        await db.command({profile: 0});
+    }
+    assert.deepEqual(own.data.items, [
+        {id: 'open-a', date, taskId: 'T1', notes: open.notes, resolved: false, solution: open.solution},
+        {id: 'legacy', ...backlog, resolved: false}
+    ]);
+    assert.deepEqual(own.refs, [
+        {type: 'report', id: 'open-a', label: `${date} T1 日报问题`},
+        {type: 'report', id: 'legacy', label: `${backlog.date} T1 日报问题`}
+    ]);
+    const reads = await db.collection('system.profile').find({'command.find': 'daily_reports'}).toArray();
+    assert.equal(reads.length, 1);
+    assert.equal(reads[0].command.filter.ownerId, 'a');
+    assert.deepEqual(Object.keys(reads[0].command.projection).sort(),
+        ['date', 'notes', 'resolved', 'resolvedAt', 'resolvedById', 'solution', 'taskId']);
+
+    const ids = result => result.data.items.map(row => row.id);
+    assert.deepEqual(ids(await query({resolvedByMe: true})), ['fixed-a-self']);
+    assert.deepEqual(ids(await query({status: 'resolved', resolvedByMe: true})), ['fixed-a-self']);
+    assert.deepEqual(ids(await query({status: 'all', resolvedByMe: false})), ['open-a', 'fixed-a-other', 'legacy']);
+    assert.deepEqual(ids(await query({status: 'all', resolvedByMe: true}, issueAdmin)), ['fixed-a-self']);
+    const team = success(await query({scope: 'team', status: 'resolved', resolvedByMe: true, taskId: 'T2'}, issueAdmin),
+        'report', '全队');
+    assert.deepEqual(team.data.items, [{
+        id: 'fixed-b', date, taskId: 'T2', notes: '已记录的问题', resolved: true, solution: '解决方案',
+        resolvedAt, resolvedById: 'a', ownerId: 'b', ownerName: '成员乙'
+    }]);
+    const targeted = success(await query({ownerId: 'b', status: 'all', resolvedByMe: true}, issueAdmin),
+        'report', '指定成员');
+    assert.deepEqual(targeted.data.items, team.data.items);
+    const other = success(await query({status: 'all', resolvedByMe: true}, {
+        ...issueReader,
+        user: b.user
+    }), 'report', '本人');
+    assert.deepEqual(other.data.items, []);
+    assert.doesNotMatch(JSON.stringify([own, team, targeted]), /禁发|detail|comments|hours|weekId|createdById/);
+});
+
+test('Mongo 日报问题区分上报日期和北京解决日期，严格按日报 date、id 续页', async t => {
+    const {store, call} = await database(t);
+    const date = range.to;
+    const yesterday = range.from;
+    const zStart = '2026-12-31T16:00:00.000Z';
+    const bjEnd = '2027-01-01T23:59:59.999+08:00';
+    await store.patch(1, [
+        ['z-start', date, zStart, true], ['bj-end', yesterday, bjEnd, true],
+        ['a-same-report-date', date, bjEnd, true],
+        ['z-next', date, '2027-01-01T16:00:00.000Z', true],
+        ['bj-previous', date, '2026-12-31T23:59:59.999+08:00', true],
+        ['reopened', date, bjEnd, false], ['invalid', date, '不能解析的日期', true], ['missing', date, undefined, true]
+    ].map(([id, reportDate, resolvedAt, resolved]) => change('dailyReports', {
+        ...report(id, 'a', reportDate, 'T1', 1), notes: '问题', resolved, resolvedAt
+    })));
+    const query = (args, principal = issueReader) => call(issueTool, args, principal);
+    const dates = {from: date, to: date};
+    const params = {...dates, dateBy: 'resolved', status: 'all', limit: 1};
+    const first = success(await query(params), 'report', '本人');
+    assert.deepEqual(first.data.items.map(row => [row.id, row.date, row.resolvedAt]), [['z-start', date, zStart]]);
+    assert.ok(first.nextCursor);
+    const second = success(await query({...params, cursor: first.nextCursor}), 'report', '本人');
+    assert.deepEqual(second.data.items.map(row => row.id), ['a-same-report-date']);
+    const last = success(await query({...params, cursor: second.nextCursor}), 'report', '本人');
+    assert.deepEqual(last.data.items.map(row => [row.id, row.date, row.resolvedAt]), [['bj-end', yesterday, bjEnd]]);
+    assert.equal(last.nextCursor, null);
+    for (const changed of [{dateBy: 'reported'}, {status: 'resolved'}, {resolvedByMe: true}, {taskId: 'T1'}]) {
+        assert.equal((await query({...params, ...changed, cursor: first.nextCursor})).code, 'INVALID_ARGUMENT');
+    }
+    assert.equal((await query({...params, cursor: first.nextCursor}, a)).code, 'FORBIDDEN');
+    const ids = result => result.data.items.map(row => row.id);
+    assert.deepEqual(ids(await query({...dates, status: 'all'})),
+        ['z-start', 'z-next', 'reopened', 'missing', 'invalid', 'bj-previous', 'a-same-report-date']);
+    assert.deepEqual(ids(await query({...dates, dateBy: 'resolved'})), ['z-start', 'a-same-report-date', 'bj-end']);
+    assert.deepEqual(ids(await query({from: '2026-12-02', to: date})), ['reopened']);
+    assert.deepEqual(ids(await query({dateBy: 'resolved'})), ['reopened']);
+    assert.deepEqual(ids(await query({dateBy: 'resolved', status: 'resolved'})),
+        ['z-start', 'z-next', 'missing', 'invalid', 'bj-previous', 'a-same-report-date', 'bj-end']);
+    await store.patch(first.teamVersion, [change('dailyReports', report('new', 'a', date, 'T1', 1))]);
+    assert.equal((await query({...params, cursor: first.nextCursor})).code, 'CONFLICT');
 });
 
 test('Mongo 游标与主体、权限、工具、过滤条件和恢复后版本绑定，超长编号也可续页', async t => {
