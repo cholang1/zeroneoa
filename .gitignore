@@ -1,0 +1,37 @@
+# 本地参考资料、截图、数据样本和旧版工程不入库。
+/00-reference/
+/01-legacy/
+# 迁移前的旧路径同样保持忽略，避免被占用的旧目录或历史备份误入库。
+/zerone-oa-web/oashare-main/
+/zerone-oa-web/assets/
+
+# 正式工作区默认跟踪源码和静态资源，仅排除依赖、产物和本机配置。
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+*.log
+.env
+.env.*
+/zerone-oa-web/apps/api/config/database.local.yaml
+/zerone-oa-web/apps/api/config/ai.local.yaml
+.idea/
+.vscode/
+
+# 上级仓库默认忽略 JSON：只放行构建必需的清单，不放行数据或导出文件。
+!/zerone-oa-web/package.json
+!/zerone-oa-web/package-lock.json
+!/zerone-oa-web/apps/*/package.json
+!/zerone-oa-web/apps/web/tsconfig.json
+!/zerone-oa-web/packages/*/package.json
+
+# 正式工作区只跟踪项目 README，专题文档和笔记保留在本地。
+*.md
+!/zerone-oa-web/README.md
+/zerone-oa-web/docs/
+
+# 保留另外两个预留项目原有的“只跟踪根 README”策略。
+/zerone-oa-japi/*
+!/zerone-oa-japi/README.md
+/zerone-oa-papi/*
+!/zerone-oa-papi/README.md

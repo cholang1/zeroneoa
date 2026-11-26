@@ -1,0 +1,15 @@
+{
+  "name": "zerone-oa-workspace",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": ["apps/web", "apps/api", "packages/contracts"],
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "web": "npm run dev -w @oa/web",
+    "api": "npm start -w @oa/api",
+    "typecheck": "npm run typecheck -w @oa/web",
+    "build": "npm run build -w @oa/web",
+    "test": "npm test -w @oa/web && npm test -w @oa/api",
+    "test:e2e": "npm run build && node --test apps/web/tests/browser.test.mjs"
+  }
+}
