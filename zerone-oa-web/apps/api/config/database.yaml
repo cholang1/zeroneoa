@@ -1,0 +1,25 @@
+# OA 后端数据库连接；修改后重启 OA 后端即可，不需要重启数据库。
+# MongoDB 服务需事先启动。常见本地端口为 27017，作者本人使用的是 27018。
+# 如需密码：复制本文件为 database.local.yaml，在副本内修改，不要提交真实凭据。
+#  | mongodb:// | 使用 MongoDB 协议连接 |
+#  | 127.0.0.1 | 本机地址 |
+#  | 27018 | 端口号（本项目默认端口） |
+#  | oa_business_dev | 数据库名称 |
+#  | retryWrites=false | 关闭自动重试写入 |
+mongodb:
+  uri: 'mongodb://127.0.0.1:27018/oa_business_dev?retryWrites=false'
+
+
+# AWS DocumentDB 示例（仅示意；目标引擎需单独验收）：
+# 在 database.local.yaml 中替换上面的 mongodb 段；账号、密码应按 URI 规则编码。
+#  | USER:PASSWORD | DocumentDB 的账号和密码（密码需要 URI 编码） |
+#  | CLUSTER_ENDPOINT | AWS DocumentDB 的集群地址 |
+#  | authSource=admin | 认证数据库 |
+#  | tls=true | 必须开启加密连接 |
+#  | replicaSet=rs0 | 副本集名称 |
+#  | readPreference=primary | 优先读主节点 |
+#  | retryWrites=false | 关闭写入重试 |
+#  | tlsCAFile | DocumentDB 需要的 CA 证书路径 |
+# mongodb:
+#   uri: 'mongodb://USER:PASSWORD@CLUSTER_ENDPOINT:27017/oa_acceptance?authSource=admin&tls=true&replicaSet=rs0&readPreference=primary&retryWrites=false'
+#   tlsCAFile: './global-bundle.pem'  # 相对于本 YAML 所在目录，也可填写绝对路径

@@ -1,0 +1,25 @@
+ai:
+  enabled: true
+  activeProfile: openai
+  timeoutMs: 30000
+
+  profiles:
+    deepseek:
+      protocol: openai-chat
+      baseUrl: https://api.deepseek.com
+      model: deepseek-flash
+      apiKeyEnv: DEEPSEEK_API_KEY
+
+    openai:
+      protocol: openai-chat
+      baseUrl: https://relay.mybotpat.uk/v1
+      model: gpt-6.2-sol
+      apiKeyEnv: OPENAI_API_KEY
+
+  # ZeroAI 业务查询默认关闭。本机授权写入同目录的 ai.local.yaml，重启 OA API 后生效。
+  readTools:
+    enabled: false
+    approvedProfile: ""  # 获准接收 OA 数据的模型配置名
+    approvedTarget: ""   # 已核准的端点和模型指纹
+    allowTeamRead: false # 允许管理员查询其他成员或全队
+    allowDetail: false   # 允许发送日报和周计划正文
