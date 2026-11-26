@@ -216,10 +216,7 @@ export function createZeroAiV2Handler(store, completeAi, businessStore, readPoli
                     controller.signal.throwIfAborted();
                     return current;
                 };
-                const executeTool = async (name, args) => {
-                    const current = await verifyTools();
-                    if (!current) throw new StateError(403, '当前未授权查询 OA。');
-                    if (streaming) event({type: 'tool', label: `正在查询${toolLabel(name)}`});
+                const runQuery = async (name, args, current) => {
                     const result = await executeReadTool({
                         store: businessStore,
                         principal: principalFor(current),
@@ -242,10 +239,31 @@ export function createZeroAiV2Handler(store, completeAi, businessStore, readPoli
                     const {refs, ...payload} = result;
                     return payload;
                 };
+                let toolCount = 0;
+                const executeTool = async (name, args) => {
+                    const current = await verifyTools();
+                    if (!current) throw new StateError(403, '当前未授权查询 OA。');
+                    const callId = `query-${++toolCount}`;
+                    const progress = status => {
+                        if (streaming && !ending && !controller.signal.aborted) {
+                            event({type: 'tool', callId, status, label: toolLabel(name)});
+                        }
+                    };
+                    progress('pending');
+                    try {
+                        const result = await runQuery(name, args, current);
+                        progress(result.ok ? 'done' : 'error');
+                        return result;
+                    } catch (error) {
+                        progress('error');
+                        throw error;
+                    }
+                };
                 await verifyTurn();
                 const answer = await completeAi(access ? [queryPrompt(access), ...start.context] : start.context, {
                     signal: controller.signal,
                     onDelta: streaming ? delta : undefined,
+                    onAnswering: streaming ? () => event({type: 'phase', phase: 'answering'}) : undefined,
                     ...(access && {tools: readToolDefinitions(principalFor(access)), executeTool, verifyTools})
                 });
                 if (!controller.signal.aborted) {

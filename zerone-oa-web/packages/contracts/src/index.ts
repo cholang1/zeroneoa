@@ -236,11 +236,17 @@ export type ZeroAiSendRequest = { turnId: string; expectedBranchEpoch?: number }
     | { regenerateMessageId: string; content?: never; editMessageId?: never }
     );
 
+export type ZeroAiToolStatus = "pending" | "done" | "error";
+
 /** 流帧带有请求轮次和序号。 */
 export type ZeroAiStreamEvent = { turnId: string; seq: number } & (
     | { type: "start" }
+    | { type: "phase"; phase: "answering" }
     | { type: "delta"; content: string }
-    | { type: "tool"; label: string }
+    /** label 只描述查询对象，同一次查询的状态用 callId 关联。 */
+    | { type: "tool"; callId: string; status: ZeroAiToolStatus; label: string }
+    /** 兼容旧服务端只携带显示文案的工具事件。 */
+    | { type: "tool"; label: string; callId?: never; status?: never }
     | { type: "result"; session?: ZeroAiSession; error?: string; status?: number }
     );
 

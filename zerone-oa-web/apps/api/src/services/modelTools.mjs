@@ -8,6 +8,21 @@ const maxToolBytes = 8 * 1024;
 const maxReplyChars = 128 * 1024;
 const maxResponseChars = 1024 * 1024;
 const namePattern = /^[a-zA-Z0-9_-]{1,64}$/;
+const finishName = 'finish_query';
+const finishTool = {
+    type: 'function', function: {
+        name: finishName, description: '无需查询或已有足够信息时单独调用，切换到正式回答；不是 OA 查询。',
+        parameters: {type: 'object', properties: {}, additionalProperties: false}
+    }
+};
+const planInstruction = '当前是查询决策阶段，不写回答正文。需要数据时调用适当的 OA 工具；不需要查询或查询已足够时单独调用 finish_query。';
+const answerInstruction = '现在直接回答用户，不再查询。涉及 OA 事实时仅依据已获准的数据，未查到或信息不足要说明。按内容需要使用 Markdown，保留段落、列表和表格应有的换行。';
+
+function withInstruction(history, instruction) {
+    const [first, ...rest] = history;
+    return first?.role === 'system' ? [{...first, content: `${first.content}\n${instruction}`}, ...rest]
+        : [{role: 'system', content: instruction}, ...history];
+}
 
 export class ModelToolError extends Error {
     constructor(code, message) {
@@ -45,14 +60,14 @@ function prepareTools(tools, executeTool, verifyTools) {
     }
 }
 
-function completeTurn(content, calls, finishReason, chunks = []) {
+function completeTurn(content, calls, finishReason) {
     if (content !== null && (typeof content !== "string" || content.length > maxReplyChars)) throw toolsUnavailable();
     if (calls != null && !Array.isArray(calls)) throw toolsUnavailable();
     if (calls?.length > maxToolCalls) throw toolLimit();
     if (calls?.length ? finishReason !== "tool_calls" : finishReason != null && finishReason !== "stop") {
         throw toolsUnavailable();
     }
-    return {content, calls: calls ?? [], chunks};
+    return {content, calls: calls ?? []};
 }
 
 function appendFragment(target, key, part, maxLength) {
@@ -61,7 +76,7 @@ function appendFragment(target, key, part, maxLength) {
     target[key] += part;
 }
 
-async function readToolStream(response) {
+async function readToolStream(response, answerDelta) {
     const chunks = [];
     const calls = [];
     let size = 0;
@@ -91,11 +106,16 @@ async function readToolStream(response) {
             }
             const {delta} = choice;
             if ((delta != null && !isObject(delta)) || delta?.function_call != null) throw toolsUnavailable();
+            if (answerDelta && delta?.tool_calls != null &&
+                (!Array.isArray(delta.tool_calls) || delta.tool_calls.length)) throw toolsUnavailable();
             if (delta?.content != null) {
                 if (typeof delta.content !== "string") throw toolsUnavailable();
                 size += delta.content.length;
                 if (size > maxReplyChars) throw toolsUnavailable();
-                if (delta.content) chunks.push(delta.content);
+                if (delta.content) {
+                    chunks.push(delta.content);
+                    answerDelta?.(delta.content);
+                }
             }
             if (delta?.tool_calls != null) {
                 if (!Array.isArray(delta.tool_calls)) throw toolsUnavailable();
@@ -124,11 +144,11 @@ async function readToolStream(response) {
     if (!done && finishReason === undefined) throw toolsUnavailable();
     // 稀疏索引表示缺了调用，不能把后面的调用当作完整批次执行。
     if (Array.from(calls).includes(undefined)) throw toolsUnavailable();
-    return completeTurn(chunks.join(""), calls, finishReason, chunks);
+    return completeTurn(chunks.join(""), calls, finishReason);
 }
 
-async function readToolCompletion(response) {
-    if (/^text\/event-stream\b/i.test(response.headers.get("content-type") ?? "")) return readToolStream(response);
+async function readToolCompletion(response, answerDelta) {
+    if (/^text\/event-stream\b/i.test(response.headers.get("content-type") ?? "")) return readToolStream(response, answerDelta);
     let body = "";
     for await (const chunk of response.body.pipeThrough(new TextDecoderStream("utf-8", {fatal: true}))) {
         body += chunk;
@@ -140,7 +160,10 @@ async function readToolCompletion(response) {
     if (payload?.error || !Array.isArray(payload?.choices) || payload.choices.length !== 1 || !isObject(message) ||
         (choice.index !== undefined && choice.index !== 0) || (message.role !== undefined && message.role !== "assistant") ||
         message.function_call != null) throw toolsUnavailable();
-    return completeTurn(message.content ?? null, message.tool_calls, choice.finish_reason);
+    const turn = completeTurn(message.content ?? null, message.tool_calls, choice.finish_reason);
+    if (answerDelta && turn.calls.length) throw toolsUnavailable();
+    if (turn.content) answerDelta?.(turn.content);
+    return turn;
 }
 
 function parseCalls(calls, validators, usedIds) {
@@ -195,6 +218,7 @@ export async function requestModelTools(messages, {model, timeoutMs, send}, {
     executeTool,
     verifyTools,
     onDelta,
+    onAnswering,
     signal: cancellation
 }) {
     cancellation?.throwIfAborted();
@@ -202,16 +226,25 @@ export async function requestModelTools(messages, {model, timeoutMs, send}, {
     const timer = setTimeout(() => deadline.abort(), Math.min(timeoutMs, 60_000));
     const signal = cancellation ? AbortSignal.any([cancellation, deadline.signal]) : deadline.signal;
     try {
-        const {definitions, validators} = prepareTools(tools, executeTool, verifyTools);
+        const decisionTools = onDelta && Array.isArray(tools) ? [...tools, finishTool] : tools;
+        const {definitions, validators} = prepareTools(decisionTools, executeTool, verifyTools);
         const history = structuredClone(messages);
         if (!Array.isArray(history)) throw toolsUnavailable();
         const usedIds = new Set();
+        let answering = false;
         for (let round = 1; round <= maxModelRequests; round++) {
-            const body = JSON.stringify({model, messages: history, stream: Boolean(onDelta), tools: definitions});
+            // 预留最后一次请求写回答，保持整轮模型请求次数及总时限不变。
+            if (onDelta && round === maxModelRequests) answering = true;
+            const body = JSON.stringify({
+                model,
+                messages: onDelta ? withInstruction(history, answering ? answerInstruction : planInstruction) : history,
+                stream: Boolean(onDelta), ...(!answering && {tools: definitions})
+            });
             // 请求已经组装好；复核通过之后才把消息（可能包含刚读到的 OA 数据）发给模型。
             const response = await untilAborted(async () => {
                 if (await verifyTools() === false) throw toolsUnavailable();
                 signal.throwIfAborted();
+                if (answering) onAnswering?.();
                 return send(body, signal);
             }, signal);
             if (!response.ok) {
@@ -220,19 +253,23 @@ export async function requestModelTools(messages, {model, timeoutMs, send}, {
                 if ([400, 404, 405, 415, 422, 501].includes(response.status)) throw toolsUnavailable();
                 throw new ModelToolError("AI_UPSTREAM", `模型接口请求失败（HTTP ${response.status}）。`);
             }
-            const {content, calls, chunks} = await untilAborted(() => readToolCompletion(response), signal);
+            const {content, calls} = await untilAborted(() => readToolCompletion(response, answering ? chunk => {
+                signal.throwIfAborted();
+                onDelta(chunk);
+            } : undefined), signal);
             signal.throwIfAborted();
             if (!calls.length) {
                 if (!content?.trim()) throw toolsUnavailable();
-                // 先辨明这一轮是最终回答，不能把可能伴随工具调用的草稿流给前端。
-                if (onDelta) {
-                    for (const chunk of chunks.length ? chunks : [content]) {
-                        signal.throwIfAborted();
-                        onDelta(chunk);
-                    }
-                    signal.throwIfAborted();
-                }
-                return {content, model};
+                if (!onDelta || answering) return {content, model};
+                // 兼容不调用 finish_query 而直接写草稿的模型；不发布草稿，让正式回答独立生成。
+                answering = true;
+                continue;
+            }
+            if (onDelta && calls.some(call => call?.function?.name === finishName)) {
+                if (calls.length !== 1) throw toolsUnavailable();
+                parseCalls(calls, validators, usedIds);
+                answering = true;
+                continue;
             }
             if (round === maxModelRequests || usedIds.size + calls.length > maxToolCalls) throw toolLimit();
             // 整批参数先通过校验，避免执行到一半才发现同批另一个调用非法。

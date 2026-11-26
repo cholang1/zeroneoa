@@ -83,9 +83,12 @@ test('手动标题优先，删除只移除指定会话并受现有隔离保护',
 
 test('流式输出可在首块后停止，保存已有内容并保留后续追问能力', {timeout: 20_000}, async t => {
     let cancelled = false;
-    const request = await api(t, async (messages, {onDelta, signal}) => {
+    const request = await api(t, async (messages, {onAnswering, onDelta, signal}) => {
         if (messages.at(-1).content === '后续追问') return {content: '新回答'};
-        if (messages.at(-1).content === '耐心等待') onDelta('已经生成的内容');
+        if (messages.at(-1).content === '耐心等待') {
+            onAnswering();
+            onDelta('已经生成的内容');
+        }
         if (!signal.aborted) await once(signal, 'abort', {signal: t.signal});
         cancelled = true;
         signal.throwIfAborted();
@@ -101,7 +104,10 @@ test('流式输出可在首块后停止，保存已有内容并保留后续追�
     const lines = createInterface({input: Readable.fromWeb(response.body)})[Symbol.asyncIterator]();
     assert.deepEqual(JSON.parse((await lines.next()).value), {type: 'start', turnId: 'streaming', seq: 1});
     assert.deepEqual(JSON.parse((await lines.next()).value), {
-        type: 'delta', turnId: 'streaming', seq: 2, content: '已经生成的内容'
+        type: 'phase', phase: 'answering', turnId: 'streaming', seq: 2
+    });
+    assert.deepEqual(JSON.parse((await lines.next()).value), {
+        type: 'delta', turnId: 'streaming', seq: 3, content: '已经生成的内容'
     });
     assert.equal((await request(`/${session.id}`, {method: 'DELETE'})).status, 409);
     const stop = turnId => request(`${path}/stop`, {method: 'POST', body: {turnId}});
@@ -111,7 +117,7 @@ test('流式输出可在首块后停止，保存已有内容并保留后续追�
     const result = JSON.parse((await lines.next()).value);
     assert.equal(result.type, 'result');
     assert.equal(result.turnId, 'streaming');
-    assert.equal(result.seq, 3);
+    assert.equal(result.seq, 4);
     assert.equal(result.session.title, '耐心等待');
     assert.deepEqual(result.session.messages.map(({content, status}) => [content, status]), [
         ['耐心等待', undefined], ['已经生成的内容', 'stopped']
@@ -139,22 +145,29 @@ test('流式输出可在首块后停止，保存已有内容并保留后续追�
     ]);
 });
 
-test('模型失败可以保留同一请求重试，超大消息不会发给模型', async t => {
+test('进入回答后若首块前超时，流式失败不保存空回复，同轮可重试', async t => {
     let calls = 0;
-    const request = await api(t, async () => {
-        calls++;
-        if (calls === 1) throw Object.assign(new Error('超时'), {code: 'AI_TIMEOUT'});
+    const request = await api(t, async (_messages, {onAnswering}) => {
+        if (++calls === 1) {
+            onAnswering();
+            throw Object.assign(new Error('超时'), {code: 'AI_TIMEOUT'});
+        }
         return {content: '重试成功'};
     });
     const {session} = await request('', {method: 'POST'});
-    const post = content => request(`/${session.id}/messages`, {
-        method: 'POST', body: {turnId: 'retry-turn', content}
+    const post = (content, stream = false) => request(`/${session.id}/messages`, {
+        method: 'POST', body: {turnId: 'retry-turn', content}, stream
     });
     assert.equal((await post('占'.repeat(12_000))).status, 413);
     assert.equal(calls, 0);
-    assert.equal((await post('等待回复')).status, 504);
+    const failure = await post('等待回复', true);
+    assert.equal(failure.status, 200);
+    const frames = (await failure.text()).trim().split('\n').map(line => JSON.parse(line));
+    assert.deepEqual(frames.map(({type}) => type), ['start', 'phase', 'result']);
+    assert.equal(frames[1].phase, 'answering');
+    assert.equal(frames[2].status, 504);
     assert.deepEqual((await request(`/${session.id}`)).session.messages, []);
-    assert.equal((await post('等待回复')).session.messages.length, 2);
+    assert.equal((await post('等待回复')).session.messages.at(-1).content, '重试成功');
     assert.equal(calls, 2);
 });
 

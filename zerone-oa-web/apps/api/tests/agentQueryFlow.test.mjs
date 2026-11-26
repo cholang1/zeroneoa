@@ -5,10 +5,11 @@ import {once} from 'node:events';
 import {mkdtemp, writeFile, rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
+import {createInterface} from 'node:readline';
+import {Readable} from 'node:stream';
 import {isolatedAgentApi} from './sessionFixture.mjs';
 import {initializeAi, requestAiChat, aiTargetKey, aiReadConfig} from '../src/services/ai.mjs';
 import {resolveReadConfig} from '../src/services/aiReadConfig.mjs';
-
 import {createZeroAiV2Handler} from '../src/routes/zeroAiV2.mjs';
 import {StateError} from '../src/repositories/schema.mjs';
 
@@ -22,29 +23,54 @@ const send = (client, path, turnId, content, options = {}) => client(`${path}/me
 const date = '2026-11-21';
 const readFrames = async response => (await response.text()).trim().split('\n').map(line => JSON.parse(line));
 
+function assertToolFrames(frames, expected) {
+    const tools = frames.filter(frame => frame.type === 'tool');
+    assert.deepEqual(tools.map(({status, label}) => [status, label]), expected);
+    const ids = new Set();
+    for (let i = 0; i < tools.length; i += 2) {
+        const {callId} = tools[i];
+        assert.ok(typeof callId === 'string' && callId.length > 0);
+        assert.equal(tools[i + 1].callId, callId);
+        assert.ok(!ids.has(callId), '每次查询应有独立的 callId');
+        ids.add(callId);
+    }
+    return tools;
+}
+
 // 真 HTTP 走完整原生协议，但模型是回环桩；测试永不向现场端点发送业务字段。
-test('原生查询→引用定位→按旧结果追问；撤权隐藏原答和派生建议，切回旧分支也不能重发', {timeout: 30000}, async t => {
+test('原生查询实时输出→引用定位→按旧结果追问；撤权后隐藏原答和派生建议', {timeout: 30000}, async t => {
     let admin = true;
     const requests = [], text = '乙的合成联调记录', forbidden = '不应外发的评论';
+    const draft = '不得显示的查询草稿', prefix = '查到了：';
+    const releaseAnswer = Promise.withResolvers();
+    const toolCall = (id, name, args) => ({id, type: 'function', function: {name, arguments: JSON.stringify(args)}});
+    const sse = (delta, finish_reason = null) => `data: ${JSON.stringify({
+        choices: [{
+            index: 0,
+            delta,
+            finish_reason
+        }]
+    })}\n\n`;
     const relay = http.createServer(async (req, res) => {
         let body = '';
         for await (const chunk of req) body += chunk;
         const payload = JSON.parse(body);
         requests.push(payload);
         const last = payload.messages.at(-1);
-        const message = last.role === 'tool' ? {content: `查到了：${text}`} : last.content === '查乙的日报' ?
-            {
-                content: null,
-                tool_calls: [{
-                    id: 'call1',
-                    type: 'function',
-                    function: {
-                        name: 'list_daily_reports',
-                        arguments: JSON.stringify({from: date, to: date, ownerId: 'member-b'})
-                    }
-                }]
-            } :
-            {content: last.content === '请给建议' ? '基于乙记录的后续建议' : '没有可用的历史查询'};
+        if (payload.stream && payload.tools === undefined) {
+            res.writeHead(200, {'Content-Type': 'text/event-stream'});
+            res.write(sse({role: 'assistant', content: prefix}));
+            await releaseAnswer.promise;
+            res.end(sse({content: text}) + sse({}, 'stop') + 'data: [DONE]\n\n');
+            return;
+        }
+        const message = last.role === 'tool' ? {content: null, tool_calls: [toolCall('finish1', 'finish_query', {})]} :
+            last.content === '查乙的日报' ? {
+                    content: draft, tool_calls: [toolCall('call1', 'list_daily_reports', {
+                        from: date, to: date, ownerId: 'member-b'
+                    })]
+                } :
+                {content: last.content === '请给建议' ? '基于乙记录的后续建议' : '没有可用的历史查询'};
         res.writeHead(200, {'Content-Type': 'application/json'});
         res.end(JSON.stringify({
             choices: [{
@@ -55,7 +81,10 @@ test('原生查询→引用定位→按旧结果追问；撤权隐藏原答和�
     });
     relay.listen(0, '127.0.0.1');
     await once(relay, 'listening');
-    t.after(() => new Promise(resolve => relay.close(resolve)));
+    t.after(() => new Promise(resolve => {
+        relay.close(resolve);
+        relay.closeAllConnections();
+    }));
     const dir = await mkdtemp(join(tmpdir(), 'oa-p2-mock-'));
     t.after(() => rm(dir, {recursive: true, force: true}));
     const configFile = join(dir, 'model.yaml');
@@ -100,20 +129,52 @@ test('原生查询→引用定位→按旧结果追问；撤权隐藏原答和�
     });
     assert.equal(saved.status, 200, saved.error);
     const path = await create(a), first = await send(a, path, 'q1', '查乙的日报', {stream: true});
-    const frames = (await first.text()).trim().split('\n').map(s => JSON.parse(s));
-    assert.ok(frames.some(f => f.type === 'tool'));
+    assert.equal(first.status, 200);
+    assert.match(first.headers.get('content-type'), /^application\/x-ndjson\b/i);
+    const lines = createInterface({input: Readable.fromWeb(first.body)});
+    const events = lines[Symbol.asyncIterator]();
+    const frames = [];
+    try {
+        // 上游未发尾块或结束标记；只有 HTTP 客户端确实收到首块，才让上游继续。
+        for (const type of ['start', 'tool', 'tool', 'phase', 'delta']) {
+            const {value, done} = await events.next();
+            assert.equal(done, false, `等待 ${type} 时客户端流已结束`);
+            const frame = JSON.parse(value);
+            assert.equal(frame.type, type, value);
+            frames.push(frame);
+        }
+        const [pending] = assertToolFrames(frames, [['pending', '日报'], ['done', '日报']]);
+        assert.notEqual(pending.callId, 'call1', '客户端 ID 由路由生成，不复用上游 ID');
+        assert.deepEqual(frames[3], {type: 'phase', phase: 'answering', turnId: 'q1', seq: 4});
+        assert.equal(frames[4].content, prefix);
+    } finally {
+        releaseAnswer.resolve();
+    }
+    for await (const line of events) frames.push(JSON.parse(line));
+    assert.deepEqual(frames.map(({type}) => type), ['start', 'tool', 'tool', 'phase', 'delta', 'delta', 'result']);
+    assert.deepEqual(frames.map(({turnId, seq}) => [turnId, seq]), frames.map((_, i) => ['q1', i + 1]));
+    assert.equal(frames[5].content, text);
+    assert.ok(!JSON.stringify(frames).includes(draft));
     const end = frames.at(-1);
     assert.equal(end.error, undefined, JSON.stringify(end));
     const message = end.session.messages.at(-1);
-    assert.equal(message.content, `查到了：${text}`);
+    assert.equal(message.content, `${prefix}${text}`);
     assert.equal(message.queryCards[0].refs[0].id, report.id);
     const ref = `${path}/messages/${message.id}/refs/report/${report.id}`;
+    const legacy = await fixture.db.collection('agent_messages').updateOne({
+            sessionId: path.slice(root.length + 1),
+            messageId: message.id
+        },
+        {$unset: {'scopeStamp.issues': ''}});
+    assert.equal(legacy.modifiedCount, 1);
     assert.equal((await a(ref)).status, 200);
     assert.equal((await b(ref)).status, 404);
     assert.equal((await a(ref.replace('report-b', 'bogus'))).status, 404);
     assert.equal(message.scopeStamp, undefined);
     assert.equal(message.evidence, undefined);
-    assert.equal(requests.length, 2);
+    assert.equal(requests.length, 3);
+    assert.equal(requests[2].stream, true);
+    assert.equal(requests[2].tools, undefined);
     const toolPayload = requests[1].messages.at(-1);
     assert.equal(toolPayload.role, 'tool');
     assert.equal(toolPayload.tool_call_id, 'call1');
@@ -136,6 +197,7 @@ test('原生查询→引用定位→按旧结果追问；撤权隐藏原答和�
     admin = false;
     const history = await a(path);
     assert.equal(history.status, 200);
+    assert.equal(history.session.messages.find(item => item.id === message.id).redacted, true);
     for (const value of [text, '基于乙记录的后续建议', 'report-b']) assert.ok(!JSON.stringify(history).includes(value));
     assert.notEqual((await a(ref)).status, 200);
     const branch = await a(`${path}/messages/select`, {method: 'POST', body: {messageId: message.id}});
@@ -256,6 +318,10 @@ test('问题授权独立控制工具、来源、证据和派生历史，不影�
     const first = await send(a, path, 'issue', '查已解决问题', {stream: true});
     assert.equal(first.status, 200);
     const frames = await readFrames(first);
+    assertToolFrames(frames, [
+        ['pending', '问题列表'], ['error', '问题列表'],
+        ['pending', '问题列表'], ['done', '问题列表']
+    ]);
     const result = frames.at(-1);
     assert.equal(result.type, 'result');
     assert.equal(result.error, undefined, JSON.stringify(result));
@@ -361,9 +427,10 @@ test('问题查询在模型回复期间被撤权时不发送或提交迟到的�
     const readPolicy = {target: 'fixture', issues: true};
     const arrived = Promise.withResolvers(), resume = Promise.withResolvers();
     const text = '不应交付的合成问题回答';
-    const api = await isolatedAgentApi(t).boot(async (_messages, {executeTool, onDelta}) => {
+    const api = await isolatedAgentApi(t).boot(async (_messages, {executeTool, onAnswering, onDelta}) => {
         const result = await executeTool('list_report_issues', {});
         assert.equal(result.ok, true, result.message);
+        onAnswering();
         arrived.resolve();
         await resume.promise;
         onDelta(text);
@@ -378,7 +445,9 @@ test('问题查询在模型回复期间被撤权时不发送或提交迟到的�
         resume.resolve();
     }
     const frames = await pending;
-    assert.deepEqual(frames.map(({type}) => type), ['start', 'tool', 'result']);
+    assert.deepEqual(frames.map(({type}) => type), ['start', 'tool', 'tool', 'phase', 'result']);
+    assertToolFrames(frames, [['pending', '问题列表'], ['done', '问题列表']]);
+    assert.deepEqual(frames[3], {type: 'phase', phase: 'answering', turnId: 'inflight', seq: 4});
     assert.equal(frames.at(-1).status, 403);
     assert.ok(!JSON.stringify(frames).includes(text));
     readPolicy.issues = true;

@@ -7,7 +7,6 @@ import {createServer} from 'node:http';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {aiTargetKey, initializeAi, requestAiChat} from '../src/services/ai.mjs';
-
 import {readToolDefinitions} from '../src/services/agentReadTools.mjs';
 
 const messages = [{role: 'user', content: '查一下我的日报'}];
@@ -163,10 +162,18 @@ test('问题工具的实际定义能通过模型协议校验，撤销该授权�
 });
 
 test('SSE 按索引拼接交错的 ID、函数名、参数和中文，工具轮草稿不外露', async t => {
+    const firstDelta = deferred();
     const {requests} = await fixture(t, async (response, n) => {
+        if (n === 2) return json(response, callsReply(call('finish', '{}', 'finish_query')));
         response.writeHead(200, {'Content-Type': 'text/event-stream; charset=utf-8'});
-        if (n === 2) {
-            response.end(sseFrame({content: '最终'}) + sseFrame({content: '答复'}, 'stop') + 'data: [DONE]\n\n');
+        if (n === 3) {
+            response.write(sseFrame({reasoning_content: '不下发的内部状态'}) + sseFrame({
+                content: '最终',
+                tool_calls: []
+            }));
+            // 首段没有实时发布就不给结束帧，回放缓存不能通过此用例。
+            await firstDelta.promise;
+            response.end(sseFrame({content: '答复'}, 'stop') + 'data: [DONE]\n\n');
             return;
         }
         const head = sseFrame({
@@ -192,7 +199,11 @@ test('SSE 按索引拼接交错的 ID、函数名、参数和中文，工具轮�
     const deltas = [];
     const args = [];
     assert.deepEqual(await requestAiChat(messages, options({
-        onDelta: chunk => deltas.push(chunk),
+        onAnswering: () => deltas.push('准备回答'),
+        onDelta: chunk => {
+            deltas.push(chunk);
+            firstDelta.resolve();
+        },
         async executeTool(name, input) {
             args.push([name, input]);
             return {};
@@ -202,9 +213,48 @@ test('SSE 按索引拼接交错的 ID、函数名、参数和中文，工具轮�
         query: '中文',
         from: '2026-11-22'
     }]]);
-    assert.deepEqual(deltas, ['最终', '答复']);
+    assert.deepEqual(deltas, ['准备回答', '最终', '答复']);
     assert.ok(requests.every(request => request.stream));
-    assert.deepEqual(requests[1].messages.slice(2).map(message => message.tool_call_id), ['c0', 'c1']);
+    assert.ok(requests[0].tools.some(tool => tool.function.name === 'finish_query'));
+    assert.equal(requests[2].tools, undefined);
+    assert.deepEqual(requests[2].messages.filter(message => message.role === 'tool').map(message => message.tool_call_id), ['c0', 'c1']);
+});
+
+test('无需查询：兼容决策轮返回文本及最终轮返回 JSON，保留空白且不回放草稿', async t => {
+    const content = '## 结果\n\n- **第一项**\n- 第二项\n';
+    const {requests} = await fixture(t, (res, n) => json(res, textReply(n === 1 ? '决策草稿' : content)));
+    const events = [];
+    const answer = await requestAiChat(messages, options({
+        onDelta: chunk => events.push(chunk), onAnswering: () => events.push('开始回答'),
+        executeTool: () => assert.fail('普通问题不执行 OA 查询')
+    }));
+    assert.deepEqual(events, ['开始回答', content]);
+    assert.equal(answer.content, content);
+    assert.equal(requests.length, 2);
+    assert.equal(requests[1].tools, undefined);
+    assert.ok(!JSON.stringify(requests[1]).includes('决策草稿'));
+});
+
+test('阶段切换只接受独立且参数有效的 finish_query；最终请求也要先复核', async t => {
+    const finish = call('finish', '{}', 'finish_query');
+    let reply;
+    const {requests} = await fixture(t, res => json(res, reply));
+    const events = [];
+    const opts = options({
+        onDelta: delta => events.push(delta), onAnswering: () => events.push('开始回答'),
+        executeTool: () => {
+            events.push('不应执行');
+        }
+    });
+    for (reply of [callsReply(finish, call('unexpected')), callsReply(call('finish', '{"extra":1}', 'finish_query'))]) {
+        await assert.rejects(requestAiChat(messages, opts), unavailable);
+    }
+    reply = callsReply(finish);
+    let pass = 0;
+    await assert.rejects(requestAiChat(messages, {...opts, verifyTools: () => ++pass === 1}), unavailable);
+    assert.equal(pass, 2);
+    assert.deepEqual(events, []);
+    assert.equal(requests.length, 3);
 });
 
 test('JSON 响应批次内任何未知、非法、截断或重复调用都不执行，协议不匹配不重发', async t => {
@@ -345,6 +395,22 @@ test('四次模型往返和六次工具调用是总上限，最后一轮只收�
     await assert.rejects(requestAiChat(messages, options({executeTool: async () => ({data: '中'.repeat(3000)})})),
         {code: 'AI_TOOL_LIMIT', message: /缩小查询范围/});
     assert.equal(requests.length - start, 1);
+});
+
+test('连续补查三轮仍能流式写正文，不增加四次往返预算', async t => {
+    const {requests} = await fixture(t, (res, n) => json(res, n < 4 ? callsReply(call(`c${n}`)) : textReply('根据三轮结果作答')));
+    const events = [];
+    await requestAiChat(messages, options({
+        executeTool: async () => {
+            events.push('查询');
+            return {ok: true};
+        },
+        onAnswering: () => events.push('准备回答'), onDelta: chunk => events.push(chunk)
+    }));
+    assert.deepEqual(events, ['查询', '查询', '查询', '准备回答', '根据三轮结果作答']);
+    assert.equal(requests.length, 4);
+    assert.equal(requests[3].tools, undefined);
+    assert.equal(requests[3].messages.filter(message => message.role === 'tool').length, 3);
 });
 
 test('超时覆盖复核及工具执行；迟到回调不会触发 HTTP 或后续工具', {timeout: 5000}, async t => {
