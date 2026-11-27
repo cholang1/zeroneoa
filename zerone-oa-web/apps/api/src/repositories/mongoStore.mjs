@@ -393,7 +393,7 @@ export async function openStore(uri, {
                     throw new StateError(503, '目标库不是已初始化的 OA 业务库；未执行维护。');
                 }
                 if (existing.some(c => c.name === 'team_states') || (existing.length && !initialized)) {
-                    throw new StateError(503, '请指定全新数据库（建议 oa_business_dev），不会修改旧库或迁移旧数据。');
+                    throw new StateError(503, '请指定全新数据库，不会修改旧库或迁移旧数据。');
                 }
                 if (!initialized) {
                     // 从未使用的库才有资格。集合建成但未写入标记就中断时，后续启动不补发资格。

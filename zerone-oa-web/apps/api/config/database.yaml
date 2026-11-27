@@ -4,10 +4,10 @@
 #  | mongodb:// | 使用 MongoDB 协议连接 |
 #  | 127.0.0.1 | 本机地址 |
 #  | 27018 | 端口号（本项目默认端口） |
-#  | oa_business_dev | 数据库名称 |
+#  | zerone_oa_db | 数据库名称 |
 #  | retryWrites=false | 关闭自动重试写入 |
 mongodb:
-  uri: 'mongodb://127.0.0.1:27018/oa_business_dev?retryWrites=false'
+  uri: 'mongodb://127.0.0.1:27018/zerone_oa_db?retryWrites=false'
 
 
 # AWS DocumentDB 示例（仅示意；目标引擎需单独验收）：
