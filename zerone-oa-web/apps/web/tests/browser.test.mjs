@@ -1470,8 +1470,10 @@ test('管理员查看他人工作内容：日报来源定位、窄屏只读展�
         change('tasks', {id: taskId, title, parentId: null, level: 1, order: 0, status: 'active', description: ''}),
         change('dailyReports', {...fields, id: 'peer-report', date, hours: 9, notes}),
         change('dailyReports', {...fields, id: 'old-report', taskId: missing, date, hours: 1, notes: ''}),
-        change('dailyReports', {...fields, id: 'previous-week-report', weekId: '2026-W52', date: '2026-12-21',
-            detail: '上一周的日报', hours: 3, notes: ''}),
+        change('dailyReports', {
+            ...fields, id: 'previous-week-report', weekId: '2026-W52', date: '2026-12-21',
+            detail: '上一周的日报', hours: 3, notes: ''
+        }),
         change('weeklyPlans', {...fields, id: 'peer-plan', completed: false}),
         change('weeklyPlans', {...fields, id: 'old-plan', taskId: missing, weekId: '2026-W52', completed: false})
     ]);

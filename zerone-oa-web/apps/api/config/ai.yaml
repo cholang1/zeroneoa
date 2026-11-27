@@ -1,7 +1,7 @@
 ai:
   enabled: true
   activeProfile: openai
-  timeoutMs: 30000
+  timeoutMs: 120000
 
   profiles:
     deepseek:
