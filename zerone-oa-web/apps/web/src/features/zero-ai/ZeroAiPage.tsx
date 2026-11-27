@@ -4,16 +4,23 @@ import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type {
     SessionUser, ZeroAiCapabilities, ZeroAiMessage, ZeroAiQueryCard, ZeroAiSendRequest, ZeroAiSession,
-    ZeroAiSessionsResponse, ZeroAiSessionSummary
+    ZeroAiSessionsResponse, ZeroAiSessionSummary, ZeroAiToolStatus
 } from "@oa/contracts";
 import {ApiError, isUncertainWrite, type TeamApi} from "../../shared/api";
 import {appError} from "../../shared/error";
 import {uid} from "../../shared/utils";
 import {MessageAction, SessionActions, ZeroAiIcon} from "./ZeroAiActions";
+import {ZeroAiProgressIcon} from "./ZeroAiProgressIcon";
 import "./zeroAi.css";
 
 const emptyDraft = (sessionId: string | null = null) => ({sessionId, turnId: uid("turn"), content: ""});
 const markdownPlugins = [remarkGfm];
+const markdownComponents: NonNullable<React.ComponentProps<typeof Markdown>["components"]> = {
+    img: ({alt}) => alt ? <span>{alt}</span> : null,
+    table: ({node: _node, ...props}) => <div className="zero-ai-markdown-table">
+        <table {...props}/>
+    </div>
+};
 const isMissingSession = (cause: unknown) => cause instanceof ApiError && cause.status === 404;
 const maxPromptLength = 4000;
 const followUps = [
@@ -28,7 +35,49 @@ const queryTime = new Intl.DateTimeFormat("zh-CN", {
 
 type OpenReportSource = (sessionId: string, messageId: string, id: string, version: number, signal: AbortSignal) =>
     Promise<string | undefined>;
-type ToolActivity = { seq: number; label: string };
+type ToolActivity = { key: string; label: string; status?: ZeroAiToolStatus };
+type ReplyPhase = "thinking" | "answering" | "settling";
+type ReplyAppearance = { key: string; activity: ToolActivity[] };
+const replyKey = (turnId: string) => `reply:${turnId}`;
+const appearanceKey = (sessionId: string, messageId: string) => JSON.stringify([sessionId, messageId]);
+// 旧服务端在权限撤销后只替换正文，没有显式标记。
+const isRedactedReply = (message: ZeroAiMessage) => message.redacted === true ||
+    message.content === "这条消息依赖的 OA 查询已不在当前授权范围内。";
+
+function ReplyProgress({activity, phase, stopping, hasContent}: {
+    activity?: ToolActivity[]; phase?: ReplyPhase; stopping?: boolean; hasContent: boolean;
+}) {
+    const waiting = phase === "thinking" || phase === "answering";
+    const spinning = waiting && !stopping;
+    const statusText = hasContent || !phase ? "" : stopping ? "正在停止生成…"
+        : phase === "settling" ? "正在确认回复…"
+            : phase === "answering" ? "正在组织回答…" : !activity?.length ? "思考中…" : "";
+    const list = activity?.length ? (
+        <ul className="zero-ai-tool-activity" aria-label="查询活动">
+            {activity.map(({key, label, status}) => {
+                const prefix = status === "done" ? "查询完成：" : status === "error" ? "查询失败："
+                    : status === "pending" ? (spinning ? "正在查询：" : "查询未完成：") : "";
+                return <li key={key}>
+                    {status && (status !== "pending" || spinning) ? <ZeroAiProgressIcon status={status}/> : null}
+                    <span>{prefix}{label}</span>
+                </li>;
+            })}
+        </ul>
+    ) : null;
+    return (
+        <>
+            {!phase && list ? (
+                <details className="zero-ai-complete-activity">
+                    <summary>查询活动（{activity?.length}）</summary>
+                    {list}
+                </details>
+            ) : list}
+            {statusText ? <p className="zero-ai-message-status zero-ai-reply-status" role="status">
+                {spinning ? <ZeroAiProgressIcon status="pending"/> : null}{statusText}
+            </p> : null}
+        </>
+    );
+}
 
 function QuerySources({cards, onOpen, checking}: {
     cards: ZeroAiQueryCard[];
@@ -85,6 +134,7 @@ interface ActiveGeneration {
     controller: AbortController;
     stop?: () => Promise<{ ok: true }>;
     stopRequested: boolean;
+    activity: ToolActivity[];
 }
 
 async function copyText(text: string) {
@@ -118,6 +168,8 @@ function Message({
                      onSelect,
                      editing,
                      activity,
+                     replyPhase,
+                     stopping,
                      onOpenSource,
                      checkingSource
                  }: {
@@ -129,6 +181,8 @@ function Message({
     onSelect?: (messageId: string) => void;
     editing?: ReactNode;
     activity?: ToolActivity[];
+    replyPhase?: ReplyPhase;
+    stopping?: boolean;
     onOpenSource?: (id: string, version: number) => void;
     checkingSource?: boolean;
 }) {
@@ -139,25 +193,17 @@ function Message({
     return (
         <article className={`zero-ai-message ${role}`} data-message-id={message.id}>
             <div className="zero-ai-message-meta">{isUser ? "我" : "ZeroAI"}</div>
+            {!isUser ? <ReplyProgress activity={activity} phase={replyPhase} stopping={stopping}
+                                      hasContent={!!content.trim()}/> : null}
             {editing ?? (content ? (
                 isUser ? <p className="zero-ai-prompt">{content}</p> : (
                     <div className="zero-ai-markdown">
-                        <Markdown
-                            skipHtml
-                            remarkPlugins={markdownPlugins}
-                            components={{img: ({alt}) => alt ? <span>{alt}</span> : null}}
-                        >
+                        <Markdown skipHtml remarkPlugins={markdownPlugins} components={markdownComponents}>
                             {content}
                         </Markdown>
                     </div>
                 )
             ) : null)}
-            {activity?.length ? (
-                <ul className="zero-ai-tool-activity" aria-label="查询活动">
-                    {activity.map(({seq, label}) => <li key={seq}>{label}</li>)}
-                </ul>
-            ) : null}
-            {pending && !content && !activity?.length ? <p className="zero-ai-message-status">正在回复…</p> : null}
             {!isUser && (queryCards?.length ? (
                 <QuerySources cards={queryCards} onOpen={onOpenSource} checking={checkingSource}/>
             ) : queryNote ? <p className="zero-ai-message-status">{queryNote}</p> : null)}
@@ -256,7 +302,9 @@ function ZeroAiChat({user, visible, api: history, readTools, readIssues, onOpenR
     const [pending, setPending] = useState<{ turnId: string; prefixLength: number; prompt?: string } | null>(null);
     const [sidebarOpen, setSidebarOpen] = useState(false);
     const [reply, setReply] = useState("");
+    const [replyPhase, setReplyPhase] = useState<ReplyPhase>("thinking");
     const [activity, setActivity] = useState<ToolActivity[]>([]);
+    const [replyAppearances, setReplyAppearances] = useState<Record<string, ReplyAppearance>>({});
     const [sourceNotice, setSourceNotice] = useState("");
     const [checkingSource, setCheckingSource] = useState(false);
     const sourceRequest = useRef<AbortController | null>(null);
@@ -281,6 +329,12 @@ function ZeroAiChat({user, visible, api: history, readTools, readIssues, onOpenR
     const canRevise = ready && !titleDraft && !editDraft && !reviewTurn && !staleSession;
     const canOpenSources = !!activeId && visible && phase !== "opening" && phase !== "loading" && phase !== "unavailable";
     const displayedMessages = pending ? session?.messages.slice(0, pending.prefixLength) : session?.messages;
+    const liveReplyId = pending ? replyKey(pending.turnId) : null;
+    const messages: ZeroAiMessage[] = [...(displayedMessages ?? [])];
+    if (pending && liveReplyId) {
+        if (pending.prompt) messages.push({id: pending.turnId, role: "user", content: pending.prompt});
+        messages.push({id: liveReplyId, role: "assistant", content: reply});
+    }
     const latestMessage = displayedMessages?.at(-1);
     const offerFollowUps = readTools && latestMessage?.role === "assistant" && !!latestMessage.queryCards?.length;
 
@@ -357,7 +411,7 @@ function ZeroAiChat({user, visible, api: history, readTools, readIssues, onOpenR
     useEffect(() => {
         const log = logRef.current;
         if (followReply.current && visible && log) log.scrollTop = log.scrollHeight;
-    }, [activeId, messageCount, reply, activity, sending, visible]);
+    }, [activeId, messageCount, reply, replyPhase, activity, stopping, sending, visible]);
 
     useLayoutEffect(() => {
         const log = logRef.current;
@@ -661,11 +715,12 @@ function ZeroAiChat({user, visible, api: history, readTools, readIssues, onOpenR
             ? session?.messages.findIndex(message => message.id === targetId) ?? -1
             : session?.messages.length ?? 0;
         if (prefixLength < 0) return;
-        const turn: ActiveGeneration = {controller: new AbortController(), stopRequested: false};
+        const turn: ActiveGeneration = {controller: new AbortController(), stopRequested: false, activity: []};
         const {signal} = turn.controller;
         generation.current = turn;
         followReply.current = true;
         setPending({turnId: request.turnId, prefixLength, prompt: request.content});
+        setReplyPhase("thinking");
         setPhase("sending");
         setError("");
         let current = session;
@@ -686,16 +741,31 @@ function ZeroAiChat({user, visible, api: history, readTools, readIssues, onOpenR
                         turn.stop = () => history.stop(user.id, id, request.turnId, signal);
                         if (turn.stopRequested) void requestStop(turn);
                         break;
+                    case "phase":
+                        setReplyPhase(event.phase);
+                        break;
                     case "delta":
+                        // 旧服务端没有回答阶段。保留增量里的空格和换行，整段交给 Markdown 解析。
+                        setReplyPhase("answering");
                         setReply(text => text + event.content);
                         break;
-                    case "tool":
-                        setActivity(items => [...items, {seq: event.seq, label: event.label}]);
+                    case "tool": {
+                        const key = event.callId === undefined ? `legacy:${event.seq}` : `call:${event.callId}`;
+                        const item = {key, label: event.label, status: event.status};
+                        const existing = turn.activity.find(activity => activity.key === key);
+                        if (existing && existing.status !== "pending") break;
+                        turn.activity = existing
+                            ? turn.activity.map(activity => activity === existing ? item : activity)
+                            : [...turn.activity, item];
+                        setActivity(turn.activity);
                         break;
+                    }
                 }
             });
             if (signal.aborted) return;
+            setReplyPhase("settling");
             if (result.status === 404) throw new ApiError(result.error ?? "这段会话已不存在。", 404);
+            if (result.status === 403) discardTransientReply();
             if (result.session) {
                 const pagingError = await applyResult(result.session);
                 if (!signal.aborted) setError([result.error, pagingError].filter(Boolean).join(" "));
@@ -705,6 +775,7 @@ function ZeroAiChat({user, visible, api: history, readTools, readIssues, onOpenR
             }
         } catch (cause) {
             if (signal.aborted) return;
+            setReplyPhase("settling");
             const failure = {targetId: current?.id, current, canRefresh: true};
             await showFailure(cause, failure);
             if (current && isUncertainWrite(cause)) {
@@ -729,10 +800,28 @@ function ZeroAiChat({user, visible, api: history, readTools, readIssues, onOpenR
             }
         }
 
+        function discardTransientReply() {
+            turn.activity = [];
+            setActivity([]);
+            setReply("");
+        }
+
         async function applyResult(next: ZeroAiSession) {
+            const answer = next.messages.at(-1);
+            const isCurrentAnswer = answer?.role === "assistant" && (request.regenerateMessageId
+                ? answer.id === request.turnId : next.messages.at(-2)?.id === request.turnId);
+            if (isCurrentAnswer && isRedactedReply(answer)) discardTransientReply();
             const {snapshot, pagingError} = await replaceSnapshot(next, undefined, signal);
             if (signal.aborted) return "";
             if (clearSentDraft(snapshot, request)) adoptSummary(next);
+            // 只把本轮真实的查询活动交给本轮回复，并沿用流式气泡的键。
+            if (isCurrentAnswer) {
+                setReplyAppearances(previous => ({
+                    ...previous, [appearanceKey(snapshot.id, answer.id)]: {
+                        key: replyKey(request.turnId), activity: turn.activity.filter(item => item.status !== undefined)
+                    }
+                }));
+            }
             // 新快照已包含本轮消息，不再叠加流式占位。
             setPending(null);
             setReply("");
@@ -905,10 +994,18 @@ function ZeroAiChat({user, visible, api: history, readTools, readIssues, onOpenR
                             {phase === "pagingMessages" ? "正在读取…" : "加载更早消息"}
                         </button>
                     ) : null}
-                    {displayedMessages?.map(message => (
-                        <Message
-                            key={message.id}
+                    {messages.map(message => {
+                        if (message.id === liveReplyId) {
+                            return <Message key={message.id} message={message} pending activity={activity}
+                                            replyPhase={replyPhase} stopping={stopping}/>;
+                        }
+                        if (message.id === pending?.turnId) return <Message key={message.id} message={message}
+                                                                            pending/>;
+                        const appearance = activeId && replyAppearances[appearanceKey(activeId, message.id)];
+                        return <Message
+                            key={appearance ? appearance.key : message.id}
                             message={message}
+                            activity={appearance && !isRedactedReply(message) ? appearance.activity : undefined}
                             copied={copiedId === message.id}
                             onCopy={() => void copy(message)}
                             onSelect={canRevise ? id => void selectVersion(id) : undefined}
@@ -944,8 +1041,8 @@ function ZeroAiChat({user, visible, api: history, readTools, readIssues, onOpenR
                                     </div>
                                 </form>
                             ) : undefined}
-                        />
-                    ))}
+                        />;
+                    })}
                     {!messageCount && !sending ? (
                         <div className="zero-ai-empty">
                             {phase === "loading" ? <strong>正在读取会话…</strong> : phase !== "unavailable" ? (
@@ -959,15 +1056,6 @@ function ZeroAiChat({user, visible, api: history, readTools, readIssues, onOpenR
                                 </>
                             ) : null}
                         </div>
-                    ) : null}
-                    {pending ? (
-                        <>
-                            {pending.prompt ? (
-                                <Message message={{id: pending.turnId, role: "user", content: pending.prompt}} pending/>
-                            ) : null}
-                            <Message pending activity={activity}
-                                     message={{id: `${pending.turnId}-reply`, role: "assistant", content: reply}}/>
-                        </>
                     ) : null}
                 </div>
                 <div className="zero-ai-composer">

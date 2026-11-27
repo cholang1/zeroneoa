@@ -108,14 +108,23 @@ test('ZeroAI 只调用 v2：503 不降级，分页、写入、流式回复和重
     const turn = {turnId: 'turn-1', content: '测试问题', expectedBranchEpoch: 2};
     const update = (seq, frame) => ({turnId: turn.turnId, seq, ...frame});
     const start = update(2, {type: 'start'});
-    const tool = update(3, {type: 'tool', label: '正在查询日报'});
-    const delta = update(6, {type: 'delta', content: '模拟回复'});
-    const result = update(7, {type: 'result', session: snapshot});
+    const legacy = update(3, {type: 'tool', label: '正在查询日报'});
+    const toolPending = update(6, {type: 'tool', callId: '日报调用', status: 'pending', label: '日报'});
+    const toolDone = update(7, {type: 'tool', callId: '日报调用', status: 'done', label: '日报'});
+    const toolError = update(8, {type: 'tool', callId: '任务调用', status: 'error', label: '任务'});
+    const phase = update(9, {type: 'phase', phase: 'answering'});
+    const delta = update(10, {type: 'delta', content: '\n\n模拟回复'});
+    const result = update(11, {type: 'result', session: snapshot});
     const frames = [
-        update(1, {type: 'new-event'}), start, tool, tool, update(4, {type: 'start'}),
+        update(1, {type: 'new-event'}), start, legacy, legacy, update(4, {type: 'start'}),
         update(5, {type: 'tool', label: 123}),
         update(99, {type: 'result', turnId: 'wrong-turn', session: {id: '旧会话'}}),
-        delta, result
+        update(99, {type: 'tool', label: '日报', status: 'pending'}),
+        update(99, {type: 'tool', label: '日报', callId: 'x'}),
+        update(99, {type: 'tool', label: '日报', callId: 'x', status: 'unknown'}),
+        update(99, {type: 'tool', label: ' ', callId: 'x', status: 'done'}),
+        update(99, {type: 'phase', phase: 'unsupported'}),
+        toolPending, toolDone, toolPending, toolError, phase, delta, result
     ];
     // 刻意拆开帧和 UTF-8 字符，最终帧没有换行。
     const bytes = Buffer.from(frames.map(frame => JSON.stringify(frame)).join('\n'));
@@ -175,7 +184,7 @@ test('ZeroAI 只调用 v2：503 不降级，分页、写入、流式回复和重
     await zeroAi.rename(userId, id, '改名');
     const events = [];
     assert.deepEqual(await zeroAi.send(userId, id, turn, signal, frame => events.push(frame)), result);
-    assert.deepEqual(events, [start, tool, delta]);
+    assert.deepEqual(events, [start, legacy, toolPending, toolDone, toolError, phase, delta]);
     await assert.rejects(zeroAi.send(userId, id, turn, signal, () => {
     }), /回复连接已断开/);
     assert.deepEqual(await zeroAi.send(userId, id, turn, signal, () => assert.fail('幂等回执不重新生成')), {

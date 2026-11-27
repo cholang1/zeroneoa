@@ -197,13 +197,24 @@ export function createTeamApi(
                             }
                             break;
                         case "delta":
-                        case "tool": {
-                            const text = event.type === "delta" ? event.content : event.label;
-                            if (typeof text !== "string" || !text.trim() && event.type === "tool") break;
+                            if (typeof event.content !== "string") break;
                             lastSeq = event.seq;
                             onEvent(event);
                             break;
-                        }
+                        case "phase":
+                            if (event.phase !== "answering") break;
+                            lastSeq = event.seq;
+                            onEvent(event);
+                            break;
+                        case "tool":
+                            if (typeof event.label !== "string" || !event.label.trim()) break;
+                            if (event.callId !== undefined || event.status !== undefined) {
+                                if (typeof event.callId !== "string" || !event.callId.trim() ||
+                                    (event.status !== "pending" && event.status !== "done" && event.status !== "error")) break;
+                            }
+                            lastSeq = event.seq;
+                            onEvent(event);
+                            break;
                     }
                 }
                 if (done) throw new Error("回复连接已断开，请重试。");

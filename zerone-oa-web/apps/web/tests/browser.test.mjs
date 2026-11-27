@@ -1124,7 +1124,184 @@ test('P2 本地浏览器：工具活动、历史来源、安全定位与窄屏�
     await tab(page, 'ZeroAI');
     await sourceGroup.waitFor();
     assert.equal(await followUp.count(), 0);
-    assert.match(await input.getAttribute('placeholder'), /当前未开放 OA 查询/);
+    assert.match(await input.getAttribute('placeholder'), /当前未开放\s*OA\s*(?:数据\s*)?查询/);
+    assert.equal(await page.getByRole('button', {name: '查我的未解决问题'}).count(), 0);
+});
+
+test('ZeroAI 本地浏览器：同一气泡展示思考、查询、流式 Markdown，停止和断线不再转圈', {timeout: 45000}, async t => {
+    const user = {id: 'progress-member', name: '进度测试成员', color: '#3574ab'};
+    const session = {id: 'progress-session', title: '查询进度', branchEpoch: 1, messages: []};
+    const sessionPath = `${zeroAiSessions}/${session.id}`;
+    const state = {
+        version: 1, users: [user], tasks: [], memos: [], weeklyPlans: [], dailyReports: [],
+        aiReminders: [], events: [], dayThreads: [], auditLog: []
+    };
+    const recovery = Promise.withResolvers();
+    const stopped = Promise.withResolvers();
+    let incoming, holdRecovery = false;
+    const backend = createHttpServer(async (request, response) => {
+        const path = new URL(request.url, 'http://localhost').pathname;
+        const json = data => {
+            response.writeHead(200, {'Content-Type': 'application/json'});
+            response.end(JSON.stringify(data));
+        };
+        if (path === '/api/session') return json({user, csrfToken: 'progress-test', mustChangePassword: false});
+        if (path === '/api/state') return json({state});
+        if (path === zeroAiCapabilities) return json({historyV2: true, readTools: true});
+        if (path === zeroAiSessions) return json({sessions: [{id: session.id, title: session.title}]});
+        if (path === sessionPath) {
+            if (holdRecovery) return recovery.resolve(() => json({session}));
+            return json({session});
+        }
+        if (path === `${sessionPath}/messages/stop`) {
+            stopped.resolve();
+            return json({ok: true});
+        }
+        if (path === `${sessionPath}/messages`) {
+            const chunks = [];
+            for await (const chunk of request) chunks.push(chunk);
+            const {content: prompt, turnId} = JSON.parse(Buffer.concat(chunks).toString());
+            response.writeHead(200, {'Content-Type': 'application/x-ndjson'});
+            let seq = 0;
+            const send = event => response.write(`${JSON.stringify({turnId, seq: ++seq, ...event})}\n`);
+            send({type: 'start'});
+            return incoming.resolve({
+                send, disconnect: () => response.end(), finish: (content, meta) => {
+                    session.messages.push({id: turnId, role: 'user', content: prompt},
+                        {id: `answer-${turnId}`, role: 'assistant', content, ...meta});
+                    session.branchEpoch++;
+                    send({type: 'result', session});
+                    response.end();
+                }
+            });
+        }
+        response.writeHead(404).end();
+    });
+    backend.listen(0, '127.0.0.1');
+    await once(backend, 'listening');
+    t.after(() => {
+        backend.close();
+        backend.closeAllConnections();
+    });
+    const web = await preview({
+        root: fileURLToPath(new URL('../', import.meta.url)), configFile: false,
+        preview: {host: 'localhost', port: 0, proxy: {'/api': `http://127.0.0.1:${backend.address().port}`}}
+    });
+    t.after(() => web.close());
+    const url = `http://localhost:${web.httpServer.address().port}`;
+    const browser = await chromium.launch({channel: process.env.OA_BROWSER_CHANNEL || 'msedge', headless: true});
+    t.after(() => browser.close());
+    const page = await browser.newPage({viewport: {width: 360, height: 740}, isMobile: true, hasTouch: true});
+    page.setDefaultTimeout(7000);
+    await page.route('**/*', route => new URL(route.request().url()).origin === url ? route.continue() : route.abort());
+    await page.goto(url);
+    await tab(page, 'ZeroAI');
+    const log = page.getByRole('log', {name: '消息'});
+    const bubble = log.locator('article.assistant').last();
+    const activity = bubble.getByRole('list', {name: '查询活动'});
+    const spinning = '.zero-ai-progress-icon[data-status="pending"]';
+
+    async function begin(prompt) {
+        incoming = Promise.withResolvers();
+        await page.getByRole('textbox', {name: '消息内容'}).fill(prompt);
+        await button(page, '发送').click();
+        await bubble.getByText('思考中…', {exact: true}).waitFor();
+        assert.equal(await bubble.locator(spinning).count(), 1);
+        return incoming.promise;
+    }
+
+    const query = await begin('显示日报和任务');
+    const sameBubble = await bubble.elementHandle();
+    query.send({type: 'tool', callId: 'reports', status: 'pending', label: '日报'});
+    await activity.getByText('正在查询：日报', {exact: true}).waitFor();
+    assert.equal(await bubble.getByText('思考中…', {exact: true}).count(), 0);
+    assert.equal(await activity.locator(spinning).count(), 1);
+    query.send({type: 'tool', callId: 'tasks', status: 'pending', label: '任务'});
+    await activity.getByText('正在查询：任务', {exact: true}).waitFor();
+    query.send({type: 'tool', callId: 'reports', status: 'done', label: '日报'});
+    query.send({type: 'tool', callId: 'reports', status: 'pending', label: '日报'});
+    query.send({type: 'tool', callId: 'tasks', status: 'error', label: '任务'});
+    await activity.getByText('查询失败：任务', {exact: true}).waitFor();
+    assert.deepEqual(await activity.getByRole('listitem').allTextContents(), ['查询完成：日报', '查询失败：任务']);
+    assert.equal(await activity.locator(spinning).count(), 0);
+    query.send({type: 'phase', phase: 'answering'});
+    await bubble.getByText('正在组织回答…', {exact: true}).waitFor();
+
+    const chunks = ['## 日报', '流式答案', '\n\n', '第一段，保留 **加', '粗** 和 `命令`。',
+        '\n\n- 第一项\n  - 嵌套项\n- 第二项', '\n\n> 单独引用',
+        '\n\n| 项目 | 进度 |', '\n| --- | --- |\n| OA | 进行中 |',
+        '\n\n```text\n    保留缩进\n', 'veryLongCommand'.repeat(24), '\n```\n\n末段。'];
+    chunks.slice(0, 5).forEach(content => query.send({type: 'delta', content}));
+    await heading(bubble, '日报流式答案').waitFor();
+    await bubble.locator('p strong').filter({hasText: '加粗'}).waitFor();
+    assert.equal(await bubble.getByText('正在组织回答…', {exact: true}).count(), 0);
+    chunks.slice(5).forEach(content => query.send({type: 'delta', content}));
+    await bubble.getByText('末段。', {exact: true}).waitFor();
+    const markdown = bubble.locator('.zero-ai-markdown');
+    assert.deepEqual(await markdown.locator(':scope > *').evaluateAll(nodes => nodes.map(node => node.tagName)),
+        ['H2', 'P', 'UL', 'BLOCKQUOTE', 'DIV', 'PRE', 'P']);
+    assert.equal(await markdown.locator('ul ul li').textContent(), '嵌套项');
+    assert.equal(await markdown.getByRole('cell', {name: '进行中'}).count(), 1);
+    assert.match(await markdown.locator('pre code').textContent(), /^ {4}保留缩进\n/);
+    assert.ok(await markdown.locator('pre').evaluate(pre => pre.scrollWidth > pre.clientWidth));
+    assert.ok(await log.evaluate(element => element.scrollWidth <= element.clientWidth));
+    assert.ok(await bubble.evaluate((element, initial) => element === initial, sameBubble));
+    query.finish(chunks.join(''));
+    await bubble.getByRole('button', {name: '复制', exact: true}).waitFor();
+    assert.ok(await bubble.evaluate((element, initial) => element === initial, sameBubble));
+    const summary = bubble.getByText('查询活动（2）', {exact: true});
+    await summary.waitFor();
+    assert.equal(await activity.count(), 0, '生成结束后默认收起');
+    await summary.click();
+    assert.deepEqual(await activity.getByRole('listitem').allTextContents(), ['查询完成：日报', '查询失败：任务']);
+    await summary.click();
+    assert.equal(await activity.count(), 0, '展开后也可以收起');
+    await sameBubble.dispose();
+
+    const plain = await begin('只聊天，不查询');
+    plain.send({type: 'delta', content: '\n\n'});
+    await bubble.getByText('正在组织回答…', {exact: true}).waitFor();
+    plain.send({type: 'delta', content: '不用查询也可以回答。'});
+    await bubble.getByText('不用查询也可以回答。', {exact: true}).waitFor();
+    assert.equal(await activity.count(), 0);
+    plain.finish('不用查询也可以回答。', {queryBasis: 'none'});
+    await bubble.getByText('本轮未查询 OA', {exact: true}).waitFor();
+
+    const stop = await begin('停止查询');
+    stop.send({type: 'tool', callId: 'stop', status: 'pending', label: '工时'});
+    await activity.getByText('正在查询：工时', {exact: true}).waitFor();
+    await button(page, '停止生成').click();
+    await stopped.promise;
+    await activity.getByText('查询未完成：工时', {exact: true}).waitFor();
+    assert.equal(await bubble.locator(spinning).count(), 0);
+    stop.finish('', {status: 'stopped'});
+    await bubble.getByText('已停止生成', {exact: true}).waitFor();
+    assert.equal(await bubble.locator(spinning).count(), 0);
+
+    const revoked = await begin('查询时撤回授权');
+    revoked.send({type: 'tool', callId: 'revoked', status: 'done', label: '受限查询'});
+    await activity.getByText('查询完成：受限查询', {exact: true}).waitFor();
+    revoked.finish('查询内容不再可见。', {redacted: true});
+    await bubble.getByText('查询内容不再可见。', {exact: true}).waitFor();
+    assert.equal(await bubble.locator('details').count(), 0);
+
+    const broken = await begin('查询中断线');
+    broken.send({type: 'tool', callId: 'broken', status: 'pending', label: '周计划'});
+    await activity.getByText('正在查询：周计划', {exact: true}).waitFor();
+    holdRecovery = true;
+    broken.disconnect();
+    const releaseRecovery = await recovery.promise;
+    await page.getByRole('alert').getByText('回复连接已断开，请重试。', {exact: true}).waitFor();
+    await activity.getByText('查询未完成：周计划', {exact: true}).waitFor();
+    assert.equal(await bubble.locator(spinning).count(), 0);
+    const legacyRedacted = '这条消息依赖的 OA 查询已不在当前授权范围内。';
+    session.messages[1].content = legacyRedacted;
+    releaseRecovery();
+    await button(page, '发送').waitFor();
+    const firstReply = log.locator('article.assistant').first();
+    await firstReply.getByText(legacyRedacted, {exact: true}).waitFor();
+    assert.equal(await firstReply.locator('details').count(), 0, '已缓存的活动也不能附到旧版脱敏回复');
+    assert.equal(await log.locator(spinning).count(), 0);
 });
 
 test('P2 本地端到端：真实本人日报查询、来源核对、返回聊天和追问', {timeout: 45000}, async t => {
@@ -1180,7 +1357,8 @@ test('P2 本地端到端：真实本人日报查询、来源核对、返回聊�
     const page = await newPage();
     await enter(page, url, account);
     await tab(page, 'ZeroAI');
-    await page.getByText('可以查询 OA，也可以直接聊天。', {exact: true}).waitFor();
+    await page.getByRole('textbox', {name: '消息内容'}).waitFor();
+    assert.equal(await page.getByRole('button', {name: '查我的未解决问题'}).count(), 0, '普通日报授权不等于问题授权');
     const input = page.getByRole('textbox', {name: '消息内容'});
     const send = page.getByRole('button', {name: '发送', exact: true});
     await input.fill(question);
