@@ -66,8 +66,10 @@ export function WeeklyPage({
                               search={activeMembers.length >= 8 ? "搜索成员姓名" : undefined}
                               options={[
                                   {value: "mine", label: "只看我（默认）"}, {value: "all", label: "所有人"},
-                                  ...activeMembers.map(member => ({value: member.id, group: "成员",
-                                      label: member.name + (member.id === user.id ? "（我）" : "")}))
+                                  ...activeMembers.map(member => ({
+                                      value: member.id, group: "成员",
+                                      label: member.name + (member.id === user.id ? "（我）" : "")
+                                  }))
                               ]}/>
                 </div>
             </div>

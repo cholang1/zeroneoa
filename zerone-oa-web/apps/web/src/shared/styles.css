@@ -664,7 +664,9 @@ code {
     filter: opacity(0.7);
 }
 
-.week-picker .oa-picker { width: 110px; }
+.week-picker .oa-picker {
+    width: 110px;
+}
 
 .week-picker .oa-picker-trigger {
     height: 30px;

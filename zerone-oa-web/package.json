@@ -2,7 +2,11 @@
   "name": "zerone-oa-workspace",
   "version": "0.1.0",
   "private": true,
-  "workspaces": ["apps/web", "apps/api", "packages/contracts"],
+  "workspaces": [
+    "apps/web",
+    "apps/api",
+    "packages/contracts"
+  ],
   "scripts": {
     "dev": "node scripts/dev.mjs",
     "web": "npm run dev -w @oa/web",

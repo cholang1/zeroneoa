@@ -9,8 +9,10 @@ export function MemoMentionPicker({users, currentUserId, mentionAll, mentionUser
                      search={users.length >= 8 ? "搜索提醒对象" : undefined}
                      value={mentionAll ? ["all"] : mentionUserIds.length ? mentionUserIds.map(id => `user:${id}`) : ["none"]}
                      options={[{value: "none", label: "不提醒"}, {value: "all", label: "@全体"},
-                         ...users.map(user => ({value: `user:${user.id}`, group: "成员",
-                             label: user.name + (user.id === currentUserId ? "（我）" : "")}))]}
+                         ...users.map(user => ({
+                             value: `user:${user.id}`, group: "成员",
+                             label: user.name + (user.id === currentUserId ? "（我）" : "")
+                         }))]}
                      onPick={key => {
                          if (key === "all" || key === "none") return onChange(key === "all", []);
                          const id = key.slice(5);
