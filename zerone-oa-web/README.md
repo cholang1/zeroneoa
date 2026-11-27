@@ -80,3 +80,4 @@ v3；停用时关开关、保留新版，不要手动降标记。
 | `npm run typecheck` | 检查前端 TypeScript 类型。 |
 | `npm test` | 运行前后端测试；MongoDB 用例使用本机 `27018` 上的独立测试库。 |
 | `npm run test:e2e` | 构建网页并运行浏览器测试，需要本机 MongoDB，默认使用 Edge。 |
+| `node --env-file-if-exists=apps/api/.env --test scripts/accept-agent-live.mjs` | 手动真实模型验收（会产生模型调用费用，不属于常规回归）：核对已批准目标、正文与问题授权后，仅使用一次性本机库里的合成记录。输出实际选用的工具、参数、命中编号和回答，检查隐式意图、不该查询的场景、上下文澄清、状态刷新及默认汇报风格。 |
